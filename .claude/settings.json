@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo '=== termcat ===' && echo '' && bd ready 2>/dev/null | head -12 || echo 'No issues ready (or bd not available)'"
+          }
+        ]
+      }
+    ]
+  }
+}
