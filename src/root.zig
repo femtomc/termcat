@@ -13,6 +13,7 @@ const std = @import("std");
 // Core types
 pub const Cell = @import("Cell.zig");
 pub const Color = Cell.Color;
+pub const ColorDepth = Cell.ColorDepth;
 pub const Attributes = Cell.Attributes;
 pub const Buffer = @import("Buffer.zig");
 pub const Renderer = @import("Renderer.zig");
@@ -47,7 +48,6 @@ pub const backend = struct {
 
     pub const PosixBackend = posix.PosixBackend;
     pub const Pty = pty.Pty;
-    pub const ColorDepth = posix.ColorDepth;
     pub const Capabilities = posix.Capabilities;
     pub const InitOptions = posix.InitOptions;
 };
@@ -57,7 +57,6 @@ pub const PosixBackend = backend.PosixBackend;
 pub const Pty = backend.Pty;
 pub const Input = input.Input;
 pub const Decoder = input.Decoder;
-pub const ColorDepth = backend.ColorDepth;
 pub const Capabilities = backend.Capabilities;
 pub const InitOptions = backend.InitOptions;
 

@@ -3,18 +3,10 @@ const posix = std.posix;
 const Event = @import("../Event.zig");
 const Size = Event.Size;
 const Input = @import("../input/Input.zig");
+const Cell = @import("../Cell.zig");
 
-/// Color depth capability levels
-pub const ColorDepth = enum {
-    /// Monochrome (2 colors)
-    mono,
-    /// Basic 8 colors
-    basic,
-    /// 256 colors
-    color_256,
-    /// True color (24-bit RGB)
-    true_color,
-};
+/// Color depth capability levels (re-exported from Cell.zig)
+pub const ColorDepth = Cell.ColorDepth;
 
 /// Terminal capabilities detected at init
 pub const Capabilities = struct {
