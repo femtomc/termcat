@@ -43,18 +43,38 @@ pub const input = struct {
 // Backend
 pub const backend = struct {
     pub const posix = @import("backend/posix.zig");
+    pub const windows = @import("backend/windows.zig");
     pub const pty = @import("backend/pty.zig");
     pub const posix_test = @import("backend/posix_test.zig");
     pub const integration_test = @import("backend/integration_test.zig");
 
     pub const PosixBackend = posix.PosixBackend;
+    pub const WindowsBackend = windows.WindowsBackend;
     pub const Pty = pty.Pty;
-    pub const Capabilities = posix.Capabilities;
-    pub const InitOptions = posix.InitOptions;
+
+    /// Platform-specific backend
+    pub const Backend = if (@import("builtin").os.tag == .windows)
+        windows.WindowsBackend
+    else
+        posix.PosixBackend;
+
+    /// Platform-specific capabilities
+    pub const Capabilities = if (@import("builtin").os.tag == .windows)
+        windows.Capabilities
+    else
+        posix.Capabilities;
+
+    /// Platform-specific init options
+    pub const InitOptions = if (@import("builtin").os.tag == .windows)
+        windows.InitOptions
+    else
+        posix.InitOptions;
 };
 
 // Convenience re-exports for backend types
 pub const PosixBackend = backend.PosixBackend;
+pub const WindowsBackend = backend.WindowsBackend;
+pub const Backend = backend.Backend;
 pub const Pty = backend.Pty;
 pub const Input = input.Input;
 pub const Decoder = input.Decoder;
@@ -62,7 +82,10 @@ pub const Capabilities = backend.Capabilities;
 pub const InitOptions = backend.InitOptions;
 
 /// Detect terminal capabilities from environment
-pub const detectCapabilities = backend.posix.detectCapabilities;
+pub const detectCapabilities = if (@import("builtin").os.tag == .windows)
+    backend.windows.detectCapabilities
+else
+    backend.posix.detectCapabilities;
 
 test {
     // Run all module tests
