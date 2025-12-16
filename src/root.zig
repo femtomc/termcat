@@ -6,7 +6,7 @@
 //! - Mouse and keyboard input
 //! - Bracketed paste support
 //! - Color and attribute handling
-//! - Diff-based rendering (future)
+//! - Diff-based rendering
 
 const std = @import("std");
 
@@ -14,6 +14,15 @@ const std = @import("std");
 pub const Cell = @import("Cell.zig");
 pub const Color = Cell.Color;
 pub const Attributes = Cell.Attributes;
+pub const Buffer = @import("Buffer.zig");
+pub const Renderer = @import("Renderer.zig");
+
+// Unicode utilities
+pub const unicode = struct {
+    pub const width = @import("unicode/width.zig");
+    pub const codePointWidth = width.codePointWidth;
+    pub const stringWidth = width.stringWidth;
+};
 
 // Event types
 pub const Event = @import("Event.zig");
