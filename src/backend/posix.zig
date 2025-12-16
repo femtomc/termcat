@@ -113,7 +113,7 @@ pub const PosixBackend = struct {
 
         // Install signal handler if requested
         if (options.install_sigwinch) {
-            try self.installSigwinchHandler();
+            self.installSigwinchHandler();
         }
 
         return self;
@@ -290,7 +290,7 @@ pub const PosixBackend = struct {
 
     /// Write data to the output buffer
     pub fn write(self: *Self, data: []const u8) !void {
-        try self.output_buffer.appendSlice(data);
+        try self.output_buffer.appendSlice(self.allocator, data);
     }
 
     /// Get a writer for the output buffer
@@ -299,17 +299,30 @@ pub const PosixBackend = struct {
     }
 
     /// Install SIGWINCH handler
-    fn installSigwinchHandler(self: *Self) !void {
+    fn installSigwinchHandler(self: *Self) void {
+        // SA_RESTART (0x0002) ensures interrupted syscalls like poll() are
+        // automatically restarted instead of returning EINTR
+        const SA_RESTART: c_uint = 0x0002;
+
         var sa: posix.Sigaction = .{
             .handler = .{ .handler = sigwinchHandler },
+            .mask = posix.sigemptyset(),
+            .flags = SA_RESTART,
+        };
+
+        // Initialize to a safe default in case sigaction fails
+        var old_sa: posix.Sigaction = .{
+            .handler = .{ .handler = null },
             .mask = posix.sigemptyset(),
             .flags = 0,
         };
 
-        var old_sa: posix.Sigaction = undefined;
+        // sigaction returns void in Zig 0.15 - errors are handled internally
+        // If this fails (extremely unlikely for SIGWINCH), old_sa remains
+        // at a safe default (null handler)
         posix.sigaction(posix.SIG.WINCH, &sa, &old_sa);
 
-        // Store full previous sigaction for proper restoration
+        // Store previous sigaction for proper restoration
         self.prev_sigaction = old_sa;
     }
 
