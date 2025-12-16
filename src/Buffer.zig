@@ -129,59 +129,222 @@ pub fn fill(self: *Buffer, rect: Rect, cell: Cell) void {
     }
 }
 
-/// Write string starting at position (handles wide chars and zero-width chars).
+/// Write string starting at position (handles wide chars and combining marks).
 /// Characters that extend beyond the right edge are clipped.
 /// Wide characters at the final column are replaced with a space.
-/// Zero-width characters (combining marks, control chars) are skipped and do not consume cells.
+/// Combining marks (zero-width, non-control) are attached to the previous base character.
+/// Control characters (including \n, \t) are skipped as they have special terminal meaning.
+/// Invalid UTF-8 sequences are replaced with U+FFFD (replacement character).
 pub fn print(self: *Buffer, x: u16, y: u16, str: []const u8, fg: Color, bg: Color, attrs: Attributes) void {
     if (y >= self.height) return;
 
     var cur_x = x;
-    var iter = std.unicode.Utf8Iterator{ .bytes = str, .i = 0 };
+    var last_cell_x: ?u16 = null; // Track position of last base character for combining marks
+    var i: usize = 0;
 
-    while (iter.nextCodepoint()) |cp| {
-        if (cur_x >= self.width) break;
+    while (i < str.len) {
+        if (cur_x >= self.width and last_cell_x == null) break;
+
+        // Decode UTF-8 with error handling
+        const decode_result = decodeUtf8(str[i..]);
+        const cp = decode_result.codepoint;
+        i += decode_result.bytes_consumed;
 
         const char_width = unicode.codePointWidth(cp);
 
         if (char_width == 0) {
-            // Zero-width character (combining mark, control char, ZWJ, etc.)
-            // Skip - do not consume a cell or advance cursor.
-            // Note: Proper grapheme cluster support would require different handling.
+            // Zero-width character - check if it's a control character or a combining mark
+            if (unicode.isCombiningMark(cp)) {
+                // Combining mark - attach to previous cell if one exists
+                if (last_cell_x) |prev_x| {
+                    if (self.index(prev_x, y)) |idx| {
+                        // Try to add combining mark to the previous cell
+                        _ = self.cells[idx].addCombining(cp);
+                        // If all slots are full, the mark is silently dropped (MVP limitation)
+                    }
+                }
+            }
+            // Control characters and other zero-width chars (ZWJ, etc.) are skipped
+            // They don't consume cells and aren't attached as combining marks
             continue;
-        } else if (char_width == 2) {
+        }
+
+        // Beyond right edge - stop processing
+        if (cur_x >= self.width) break;
+
+        if (char_width == 2) {
             // Wide character - needs 2 cells
             if (cur_x + 1 >= self.width) {
                 // Can't fit wide char at final column - replace with space
                 self.setCell(cur_x, y, Cell{
                     .char = ' ',
+                    .combining = .{ 0, 0 },
                     .fg = fg,
                     .bg = bg,
                     .attrs = attrs,
                 });
+                last_cell_x = cur_x;
                 break;
             }
             // First cell: the character
             self.setCell(cur_x, y, Cell{
                 .char = cp,
+                .combining = .{ 0, 0 },
                 .fg = fg,
                 .bg = bg,
                 .attrs = attrs,
             });
             // Second cell: continuation marker
             self.setCell(cur_x + 1, y, Cell.continuation(fg, bg, attrs));
+            last_cell_x = cur_x;
             cur_x += 2;
         } else {
             // Regular width character (width 1)
             self.setCell(cur_x, y, Cell{
                 .char = cp,
+                .combining = .{ 0, 0 },
                 .fg = fg,
                 .bg = bg,
                 .attrs = attrs,
             });
+            last_cell_x = cur_x;
             cur_x += 1;
         }
     }
+}
+
+/// Decode result for UTF-8 handling
+const DecodeResult = struct {
+    codepoint: u21,
+    bytes_consumed: usize,
+};
+
+/// Decode a single UTF-8 codepoint from a byte slice.
+/// Returns U+FFFD (replacement character) for invalid sequences.
+/// On invalid sequences, consumes only the invalid leading byte to allow resync
+/// with subsequent valid bytes.
+fn decodeUtf8(bytes: []const u8) DecodeResult {
+    if (bytes.len == 0) {
+        return .{ .codepoint = 0xFFFD, .bytes_consumed = 0 };
+    }
+
+    const first_byte = bytes[0];
+
+    // Determine expected sequence length from first byte
+    const seq_len: usize = if (first_byte < 0x80)
+        1
+    else if (first_byte & 0xE0 == 0xC0)
+        2
+    else if (first_byte & 0xF0 == 0xE0)
+        3
+    else if (first_byte & 0xF8 == 0xF0)
+        4
+    else {
+        // Invalid start byte - consume only it and return replacement
+        return .{ .codepoint = 0xFFFD, .bytes_consumed = 1 };
+    };
+
+    // ASCII is always valid
+    if (seq_len == 1) {
+        return .{ .codepoint = first_byte, .bytes_consumed = 1 };
+    }
+
+    // Check if we have enough bytes and if continuation bytes are valid
+    // Valid continuation bytes are 0x80-0xBF (10xxxxxx pattern)
+    if (bytes.len < seq_len) {
+        // Truncated sequence at end of input - consume remaining bytes
+        return .{ .codepoint = 0xFFFD, .bytes_consumed = bytes.len };
+    }
+
+    // Validate continuation bytes before decoding
+    for (bytes[1..seq_len]) |b| {
+        if (b & 0xC0 != 0x80) {
+            // Invalid continuation byte - consume only the lead byte to resync
+            return .{ .codepoint = 0xFFFD, .bytes_consumed = 1 };
+        }
+    }
+
+    // All continuation bytes are valid, try to decode
+    const result = std.unicode.utf8Decode(bytes[0..seq_len]) catch {
+        // Decode failed (e.g., overlong encoding, surrogate) - consume the sequence
+        return .{ .codepoint = 0xFFFD, .bytes_consumed = seq_len };
+    };
+
+    return .{ .codepoint = result, .bytes_consumed = seq_len };
+}
+
+/// Write string starting at position, returning the number of cells consumed.
+/// Similar to print() but returns the display width of the printed text.
+/// Control characters are skipped, invalid UTF-8 replaced with U+FFFD.
+pub fn printLen(self: *Buffer, x: u16, y: u16, str: []const u8, fg: Color, bg: Color, attrs: Attributes) u16 {
+    if (y >= self.height) return 0;
+
+    const start_x = x;
+    var cur_x = x;
+    var last_cell_x: ?u16 = null;
+    var i: usize = 0;
+
+    while (i < str.len) {
+        if (cur_x >= self.width and last_cell_x == null) break;
+
+        // Decode UTF-8 with error handling
+        const decode_result = decodeUtf8(str[i..]);
+        const cp = decode_result.codepoint;
+        i += decode_result.bytes_consumed;
+
+        const char_width = unicode.codePointWidth(cp);
+
+        if (char_width == 0) {
+            // Only attach actual combining marks, not control chars
+            if (unicode.isCombiningMark(cp)) {
+                if (last_cell_x) |prev_x| {
+                    if (self.index(prev_x, y)) |idx| {
+                        _ = self.cells[idx].addCombining(cp);
+                    }
+                }
+            }
+            continue;
+        }
+
+        if (cur_x >= self.width) break;
+
+        if (char_width == 2) {
+            if (cur_x + 1 >= self.width) {
+                self.setCell(cur_x, y, Cell{
+                    .char = ' ',
+                    .combining = .{ 0, 0 },
+                    .fg = fg,
+                    .bg = bg,
+                    .attrs = attrs,
+                });
+                last_cell_x = cur_x;
+                cur_x += 1;
+                break;
+            }
+            self.setCell(cur_x, y, Cell{
+                .char = cp,
+                .combining = .{ 0, 0 },
+                .fg = fg,
+                .bg = bg,
+                .attrs = attrs,
+            });
+            self.setCell(cur_x + 1, y, Cell.continuation(fg, bg, attrs));
+            last_cell_x = cur_x;
+            cur_x += 2;
+        } else {
+            self.setCell(cur_x, y, Cell{
+                .char = cp,
+                .combining = .{ 0, 0 },
+                .fg = fg,
+                .bg = bg,
+                .attrs = attrs,
+            });
+            last_cell_x = cur_x;
+            cur_x += 1;
+        }
+    }
+
+    return cur_x - start_x;
 }
 
 /// Get buffer size
@@ -351,7 +514,7 @@ test "Buffer print wide char at final column replaced with space" {
     try std.testing.expectEqual(@as(u21, ' '), buf.getCell(4, 0).char);
 }
 
-test "Buffer print skips zero-width characters" {
+test "Buffer print attaches combining marks to base character" {
     var buf = try Buffer.init(std.testing.allocator, .{ .width = 20, .height = 5 });
     defer buf.deinit();
 
@@ -359,11 +522,47 @@ test "Buffer print skips zero-width characters" {
     // "é" as "e" + combining acute = e + U+0301
     buf.print(0, 0, "e\xCC\x81x", .default, .default, .{}); // e + combining acute + x
 
-    // 'e' at position 0, combining mark skipped, 'x' at position 1
+    // 'e' at position 0 with combining acute attached
     try std.testing.expectEqual(@as(u21, 'e'), buf.getCell(0, 0).char);
+    try std.testing.expectEqual(@as(u21, 0x0301), buf.getCell(0, 0).combining[0]);
+    try std.testing.expectEqual(@as(u21, 0), buf.getCell(0, 0).combining[1]);
+
+    // 'x' at position 1 (combining mark didn't consume a cell)
     try std.testing.expectEqual(@as(u21, 'x'), buf.getCell(1, 0).char);
+    try std.testing.expectEqual(@as(u21, 0), buf.getCell(1, 0).combining[0]);
+
     // Position 2 should still be default
     try std.testing.expect(buf.getCell(2, 0).eql(Cell.default));
+}
+
+test "Buffer print with multiple combining marks" {
+    var buf = try Buffer.init(std.testing.allocator, .{ .width = 20, .height = 5 });
+    defer buf.deinit();
+
+    // Print "o" + combining acute (U+0301) + combining diaeresis (U+0308)
+    buf.print(0, 0, "o\xCC\x81\xCC\x88", .default, .default, .{});
+
+    // 'o' at position 0 with both combining marks
+    try std.testing.expectEqual(@as(u21, 'o'), buf.getCell(0, 0).char);
+    try std.testing.expectEqual(@as(u21, 0x0301), buf.getCell(0, 0).combining[0]);
+    try std.testing.expectEqual(@as(u21, 0x0308), buf.getCell(0, 0).combining[1]);
+}
+
+test "Buffer print drops excess combining marks" {
+    var buf = try Buffer.init(std.testing.allocator, .{ .width = 20, .height = 5 });
+    defer buf.deinit();
+
+    // Print "a" with 3 combining marks (only 2 slots available)
+    // U+0301 (acute), U+0308 (diaeresis), U+0327 (cedilla)
+    buf.print(0, 0, "a\xCC\x81\xCC\x88\xCC\xA7x", .default, .default, .{});
+
+    // 'a' at position 0 with first two combining marks (third dropped)
+    try std.testing.expectEqual(@as(u21, 'a'), buf.getCell(0, 0).char);
+    try std.testing.expectEqual(@as(u21, 0x0301), buf.getCell(0, 0).combining[0]);
+    try std.testing.expectEqual(@as(u21, 0x0308), buf.getCell(0, 0).combining[1]);
+
+    // 'x' at position 1
+    try std.testing.expectEqual(@as(u21, 'x'), buf.getCell(1, 0).char);
 }
 
 test "Buffer setWideCell" {
@@ -404,4 +603,81 @@ test "Buffer setWideCell fails at right edge" {
 
     // Cell should remain unchanged (default)
     try std.testing.expect(buf.getCell(4, 0).eql(Cell.default));
+}
+
+test "Buffer print skips control characters" {
+    var buf = try Buffer.init(std.testing.allocator, .{ .width = 20, .height = 5 });
+    defer buf.deinit();
+
+    // Print string with embedded newline and tab - should be skipped
+    buf.print(0, 0, "a\nb\tc", .default, .default, .{});
+
+    // Control characters are skipped, so we get "abc" at positions 0, 1, 2
+    try std.testing.expectEqual(@as(u21, 'a'), buf.getCell(0, 0).char);
+    try std.testing.expectEqual(@as(u21, 'b'), buf.getCell(1, 0).char);
+    try std.testing.expectEqual(@as(u21, 'c'), buf.getCell(2, 0).char);
+    // No combining marks attached from control chars
+    try std.testing.expectEqual(@as(u21, 0), buf.getCell(0, 0).combining[0]);
+}
+
+test "Buffer print handles invalid UTF-8 with replacement char" {
+    var buf = try Buffer.init(std.testing.allocator, .{ .width = 20, .height = 5 });
+    defer buf.deinit();
+
+    // Print string with invalid UTF-8 byte (0xFF is never valid in UTF-8)
+    buf.print(0, 0, "a\xFFb", .default, .default, .{});
+
+    // 'a' at position 0
+    try std.testing.expectEqual(@as(u21, 'a'), buf.getCell(0, 0).char);
+    // U+FFFD (replacement char) at position 1 from invalid byte
+    try std.testing.expectEqual(@as(u21, 0xFFFD), buf.getCell(1, 0).char);
+    // 'b' at position 2
+    try std.testing.expectEqual(@as(u21, 'b'), buf.getCell(2, 0).char);
+}
+
+test "Buffer print handles truncated UTF-8 sequence" {
+    var buf = try Buffer.init(std.testing.allocator, .{ .width = 20, .height = 5 });
+    defer buf.deinit();
+
+    // Print string with truncated 2-byte sequence (starts with 0xC2 but no continuation)
+    buf.print(0, 0, "a\xC2", .default, .default, .{});
+
+    // 'a' at position 0
+    try std.testing.expectEqual(@as(u21, 'a'), buf.getCell(0, 0).char);
+    // U+FFFD at position 1 from truncated sequence
+    try std.testing.expectEqual(@as(u21, 0xFFFD), buf.getCell(1, 0).char);
+}
+
+test "Buffer print resyncs after invalid continuation byte" {
+    var buf = try Buffer.init(std.testing.allocator, .{ .width = 20, .height = 5 });
+    defer buf.deinit();
+
+    // Print "a\xC2b" - 0xC2 expects a continuation byte (0x80-0xBF)
+    // but 'b' (0x62) is not a valid continuation, so we should:
+    // - Output 'a' at position 0
+    // - Output U+FFFD at position 1 (for the invalid 0xC2)
+    // - Resync and output 'b' at position 2
+    buf.print(0, 0, "a\xC2b", .default, .default, .{});
+
+    try std.testing.expectEqual(@as(u21, 'a'), buf.getCell(0, 0).char);
+    try std.testing.expectEqual(@as(u21, 0xFFFD), buf.getCell(1, 0).char);
+    try std.testing.expectEqual(@as(u21, 'b'), buf.getCell(2, 0).char);
+}
+
+test "Buffer print does not panic on various invalid UTF-8" {
+    var buf = try Buffer.init(std.testing.allocator, .{ .width = 20, .height = 5 });
+    defer buf.deinit();
+
+    // Various invalid UTF-8 sequences that should NOT cause a panic
+    // Overlong encoding
+    buf.print(0, 0, "\xC0\x80", .default, .default, .{});
+    // Invalid continuation byte
+    buf.print(0, 1, "\xE0\x80\x80", .default, .default, .{});
+    // Surrogate halves
+    buf.print(0, 2, "\xED\xA0\x80", .default, .default, .{});
+    // Random invalid bytes
+    buf.print(0, 3, "\xFE\xFF", .default, .default, .{});
+
+    // If we get here without panic, the test passes
+    // The exact output doesn't matter, just that we didn't crash
 }

@@ -151,8 +151,8 @@ fn renderFull(self: *Renderer, writer: anytype) !void {
             // Update attributes if changed
             try self.emitAttributeChanges(writer, cell, &last_fg, &last_bg, &last_attrs);
 
-            // Emit character
-            try self.emitChar(writer, cell.char);
+            // Emit character and combining marks
+            try self.emitCell(writer, cell);
 
             x += 1;
         }
@@ -197,8 +197,8 @@ fn renderDiff(self: *Renderer, writer: anytype) !void {
             // Update attributes if changed
             try self.emitAttributeChanges(writer, back_cell, &last_fg, &last_bg, &last_attrs);
 
-            // Emit character
-            try self.emitChar(writer, back_cell.char);
+            // Emit character and combining marks
+            try self.emitCell(writer, back_cell);
 
             // Track position for grouping consecutive writes
             last_x = x + 1;
@@ -303,12 +303,24 @@ fn emitBgColor(self: *Renderer, writer: anytype, color: Color) !void {
     }
 }
 
-/// Emit a character (UTF-8 encoded)
-fn emitChar(self: *Renderer, writer: anytype, char: u21) !void {
+/// Emit a character with its combining marks (UTF-8 encoded)
+fn emitCell(self: *Renderer, writer: anytype, cell: Cell) !void {
     _ = self;
     var buf: [4]u8 = undefined;
-    const len = std.unicode.utf8Encode(char, &buf) catch 1;
+
+    // Emit base character
+    const len = std.unicode.utf8Encode(cell.char, &buf) catch blk: {
+        // Invalid codepoint - emit replacement character (U+FFFD)
+        break :blk std.unicode.utf8Encode(0xFFFD, &buf) catch 1;
+    };
     try writer.writeAll(buf[0..len]);
+
+    // Emit combining marks
+    for (cell.combining) |mark| {
+        if (mark == 0) break;
+        const mark_len = std.unicode.utf8Encode(mark, &buf) catch continue;
+        try writer.writeAll(buf[0..mark_len]);
+    }
 }
 
 test "Renderer init and deinit" {
@@ -422,4 +434,108 @@ test "Renderer attributes output" {
     try std.testing.expect(std.mem.indexOf(u8, output.items, "\x1b[1m") != null); // bold
     try std.testing.expect(std.mem.indexOf(u8, output.items, "\x1b[3m") != null); // italic
     try std.testing.expect(std.mem.indexOf(u8, output.items, "\x1b[4m") != null); // underline
+}
+
+test "Renderer emits combining marks" {
+    var renderer = try Renderer.init(std.testing.allocator, .{ .width = 10, .height = 5 }, .true_color);
+    defer renderer.deinit();
+
+    const buf = renderer.buffer();
+    // Set a cell with 'e' and combining acute accent (U+0301)
+    buf.setCell(0, 0, Cell{
+        .char = 'e',
+        .combining = .{ 0x0301, 0 }, // combining acute
+        .fg = .default,
+        .bg = .default,
+        .attrs = .{},
+    });
+
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(std.testing.allocator);
+
+    try renderer.flush(output.writer(std.testing.allocator));
+
+    // Output should contain 'e' followed by combining acute (U+0301 = 0xCC 0x81 in UTF-8)
+    try std.testing.expect(std.mem.indexOf(u8, output.items, "e\xCC\x81") != null);
+}
+
+test "Renderer emits wide characters correctly" {
+    var renderer = try Renderer.init(std.testing.allocator, .{ .width = 10, .height = 5 }, .true_color);
+    defer renderer.deinit();
+
+    const buf = renderer.buffer();
+    // Use print to set a wide character (CJK)
+    buf.print(0, 0, "中", .default, .default, .{});
+
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(std.testing.allocator);
+
+    try renderer.flush(output.writer(std.testing.allocator));
+
+    // Output should contain the CJK character (中 = U+4E2D = 0xE4 0xB8 0xAD in UTF-8)
+    try std.testing.expect(std.mem.indexOf(u8, output.items, "\xE4\xB8\xAD") != null);
+}
+
+test "Renderer diff skips unchanged cells" {
+    var renderer = try Renderer.init(std.testing.allocator, .{ .width = 10, .height = 5 }, .true_color);
+    defer renderer.deinit();
+
+    const buf = renderer.buffer();
+    buf.print(0, 0, "Hello", .default, .default, .{});
+
+    var output1: std.ArrayList(u8) = .empty;
+    defer output1.deinit(std.testing.allocator);
+    try renderer.flush(output1.writer(std.testing.allocator));
+
+    // Change only one cell
+    buf.setCell(2, 0, Cell{
+        .char = 'X',
+        .combining = .{ 0, 0 },
+        .fg = .default,
+        .bg = .default,
+        .attrs = .{},
+    });
+
+    var output2: std.ArrayList(u8) = .empty;
+    defer output2.deinit(std.testing.allocator);
+    try renderer.flush(output2.writer(std.testing.allocator));
+
+    // Second flush should be smaller (diff-based) and contain 'X'
+    try std.testing.expect(output2.items.len < output1.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, output2.items, "X") != null);
+}
+
+test "Renderer handles combining marks in diff" {
+    var renderer = try Renderer.init(std.testing.allocator, .{ .width = 10, .height = 5 }, .true_color);
+    defer renderer.deinit();
+
+    const buf = renderer.buffer();
+    // First render with plain 'e'
+    buf.setCell(0, 0, Cell{
+        .char = 'e',
+        .combining = .{ 0, 0 },
+        .fg = .default,
+        .bg = .default,
+        .attrs = .{},
+    });
+
+    var output1: std.ArrayList(u8) = .empty;
+    defer output1.deinit(std.testing.allocator);
+    try renderer.flush(output1.writer(std.testing.allocator));
+
+    // Now change to 'e' with combining mark - should trigger re-render
+    buf.setCell(0, 0, Cell{
+        .char = 'e',
+        .combining = .{ 0x0301, 0 },
+        .fg = .default,
+        .bg = .default,
+        .attrs = .{},
+    });
+
+    var output2: std.ArrayList(u8) = .empty;
+    defer output2.deinit(std.testing.allocator);
+    try renderer.flush(output2.writer(std.testing.allocator));
+
+    // Second output should contain the combining mark
+    try std.testing.expect(std.mem.indexOf(u8, output2.items, "e\xCC\x81") != null);
 }

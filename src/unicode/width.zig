@@ -44,8 +44,9 @@ fn isZeroWidth(cp: u21) bool {
         (cp >= 0xE0100 and cp <= 0xE01EF); // Variation Selectors Supplement
 }
 
-/// Check if codepoint is a combining mark (zero-width)
-fn isCombiningMark(cp: u21) bool {
+/// Check if codepoint is a combining mark (zero-width, attaches to previous base char).
+/// This is PUBLIC so Buffer.print can distinguish combining marks from control chars.
+pub fn isCombiningMark(cp: u21) bool {
     return
     // Combining Diacritical Marks
     (cp >= 0x0300 and cp <= 0x036F) or
@@ -178,4 +179,59 @@ test "stringWidth" {
     try std.testing.expectEqual(@as(usize, 5), stringWidth("Hello"));
     try std.testing.expectEqual(@as(usize, 2), stringWidth("中")); // One CJK char = width 2
     try std.testing.expectEqual(@as(usize, 6), stringWidth("Hi中文")); // H(1) + i(1) + 中(2) + 文(2) = 6
+}
+
+test "stringWidth with combining marks" {
+    // "é" as "e" + combining acute = e(1) + combining(0) = 1
+    try std.testing.expectEqual(@as(usize, 1), stringWidth("e\xCC\x81"));
+    // "café" = c(1) + a(1) + f(1) + e(1) + combining(0) = 4
+    try std.testing.expectEqual(@as(usize, 4), stringWidth("cafe\xCC\x81"));
+}
+
+test "stringWidth with ZWJ sequences" {
+    // ZWJ has width 0
+    try std.testing.expectEqual(@as(u2, 0), codePointWidth(0x200D));
+    // Note: Complex ZWJ emoji sequences are NOT fully supported in MVP
+    // Each codepoint is measured individually, so 👨‍👩‍👧 (family emoji)
+    // would count as sum of individual emoji widths, not 2
+}
+
+test "variation selectors have width 0" {
+    // Text presentation selector (VS15)
+    try std.testing.expectEqual(@as(u2, 0), codePointWidth(0xFE0E));
+    // Emoji presentation selector (VS16)
+    try std.testing.expectEqual(@as(u2, 0), codePointWidth(0xFE0F));
+}
+
+test "more CJK ranges" {
+    // CJK Radicals Supplement
+    try std.testing.expectEqual(@as(u2, 2), codePointWidth(0x2E80));
+    // Kangxi Radicals
+    try std.testing.expectEqual(@as(u2, 2), codePointWidth(0x2F00));
+    // CJK Symbols and Punctuation
+    try std.testing.expectEqual(@as(u2, 2), codePointWidth(0x3000)); // Ideographic space
+    // Yi Syllables
+    try std.testing.expectEqual(@as(u2, 2), codePointWidth(0xA000));
+}
+
+test "more emoji ranges" {
+    // Miscellaneous Symbols and Pictographs
+    try std.testing.expectEqual(@as(u2, 2), codePointWidth(0x1F300)); // Cyclone
+    // Emoticons
+    try std.testing.expectEqual(@as(u2, 2), codePointWidth(0x1F600)); // Grinning Face
+    // Transport and Map Symbols
+    try std.testing.expectEqual(@as(u2, 2), codePointWidth(0x1F680)); // Rocket
+    // Supplemental Symbols and Pictographs
+    try std.testing.expectEqual(@as(u2, 2), codePointWidth(0x1F900)); // Face with monocle (approx)
+}
+
+test "extended combining marks" {
+    // Combining Diacritical Marks Extended
+    try std.testing.expectEqual(@as(u2, 0), codePointWidth(0x1AB0));
+    // Combining Diacritical Marks Supplement
+    try std.testing.expectEqual(@as(u2, 0), codePointWidth(0x1DC0));
+    // Combining Diacritical Marks for Symbols
+    try std.testing.expectEqual(@as(u2, 0), codePointWidth(0x20D0));
+    // Combining Half Marks
+    try std.testing.expectEqual(@as(u2, 0), codePointWidth(0xFE20));
 }
