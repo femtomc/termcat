@@ -74,8 +74,8 @@ pub const Pty = struct {
         var fds = [_]posix.pollfd{
             .{
                 .fd = self.master,
-                .events = .{ .IN = true },
-                .revents = .{},
+                .events = posix.POLL.IN,
+                .revents = 0,
             },
         };
 
@@ -92,8 +92,8 @@ pub const Pty = struct {
 
     /// Read all available output with a timeout
     pub fn readAllOutput(self: Self, allocator: std.mem.Allocator, timeout_ms: u32) ![]u8 {
-        var result = std.ArrayList(u8).init(allocator);
-        errdefer result.deinit();
+        var result: std.ArrayList(u8) = .empty;
+        errdefer result.deinit(allocator);
 
         var buf: [1024]u8 = undefined;
         var elapsed: u32 = 0;
@@ -102,7 +102,7 @@ pub const Pty = struct {
         while (elapsed < timeout_ms) {
             const n = try self.readOutput(&buf);
             if (n > 0) {
-                try result.appendSlice(buf[0..n]);
+                try result.appendSlice(allocator, buf[0..n]);
                 elapsed = 0; // Reset timeout after receiving data
             } else {
                 elapsed += poll_interval;
@@ -110,7 +110,7 @@ pub const Pty = struct {
             }
         }
 
-        return result.toOwnedSlice();
+        return result.toOwnedSlice(allocator);
     }
 
     /// Get the slave file descriptor (for passing to terminal init)

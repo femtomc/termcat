@@ -142,6 +142,33 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
 
+    // Examples
+    const examples = [_]struct { name: []const u8, path: []const u8 }{
+        .{ .name = "input_logger", .path = "examples/input_logger.zig" },
+        .{ .name = "color_grid", .path = "examples/color_grid.zig" },
+    };
+
+    for (examples) |example| {
+        const example_exe = b.addExecutable(.{
+            .name = example.name,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(example.path),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "termcat", .module = mod },
+                },
+            }),
+        });
+        b.installArtifact(example_exe);
+
+        const run_example = b.addRunArtifact(example_exe);
+        run_example.step.dependOn(b.getInstallStep());
+
+        const run_example_step = b.step(example.name, b.fmt("Run the {s} example", .{example.name}));
+        run_example_step.dependOn(&run_example.step);
+    }
+
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
     // The Zig build system is entirely implemented in userland, which means

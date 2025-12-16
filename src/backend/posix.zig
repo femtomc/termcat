@@ -48,6 +48,8 @@ pub const PosixBackend = struct {
     options: InitOptions,
     /// Whether terminal is currently in raw mode
     in_raw_mode: bool,
+    /// Allocator used for output buffer
+    allocator: std.mem.Allocator,
     /// Output buffer for batching writes
     output_buffer: std.ArrayList(u8),
     /// Previous SIGWINCH handler (stored per instance for safe restoration)
@@ -93,12 +95,13 @@ pub const PosixBackend = struct {
             .capabilities = capabilities,
             .options = options,
             .in_raw_mode = false,
-            .output_buffer = std.ArrayList(u8).init(allocator),
+            .allocator = allocator,
+            .output_buffer = .empty,
             .prev_sigaction = null,
             .input_handler = Input.init(allocator, tty_fd),
         };
 
-        errdefer self.output_buffer.deinit();
+        errdefer self.output_buffer.deinit(allocator);
         errdefer self.input_handler.deinit();
 
         // Enter raw mode and set up terminal
@@ -144,7 +147,7 @@ pub const PosixBackend = struct {
         self.input_handler.deinit();
 
         // Free output buffer
-        self.output_buffer.deinit();
+        self.output_buffer.deinit(self.allocator);
 
         // Close fd if we own it
         if (self.owns_fd) {
@@ -211,7 +214,7 @@ pub const PosixBackend = struct {
 
     /// Write terminal initialization escape sequences
     fn writeInitSequences(self: *Self) !void {
-        const w = self.output_buffer.writer();
+        const w = self.output_buffer.writer(self.allocator);
 
         // Enter alternate screen buffer
         try w.writeAll("\x1b[?1049h");
@@ -244,7 +247,7 @@ pub const PosixBackend = struct {
 
     /// Write terminal cleanup escape sequences
     fn writeCleanupSequences(self: *Self) !void {
-        const w = self.output_buffer.writer();
+        const w = self.output_buffer.writer(self.allocator);
 
         // Disable focus events
         if (self.options.enable_focus_events and self.capabilities.focus_events) {
@@ -292,19 +295,19 @@ pub const PosixBackend = struct {
 
     /// Get a writer for the output buffer
     pub fn writer(self: *Self) std.ArrayList(u8).Writer {
-        return self.output_buffer.writer();
+        return self.output_buffer.writer(self.allocator);
     }
 
     /// Install SIGWINCH handler
     fn installSigwinchHandler(self: *Self) !void {
         var sa: posix.Sigaction = .{
             .handler = .{ .handler = sigwinchHandler },
-            .mask = posix.empty_sigset,
-            .flags = .{ .RESTART = true },
+            .mask = posix.sigemptyset(),
+            .flags = 0,
         };
 
         var old_sa: posix.Sigaction = undefined;
-        try posix.sigaction(posix.SIG.WINCH, &sa, &old_sa);
+        posix.sigaction(posix.SIG.WINCH, &sa, &old_sa);
 
         // Store full previous sigaction for proper restoration
         self.prev_sigaction = old_sa;
@@ -315,13 +318,13 @@ pub const PosixBackend = struct {
         if (self.prev_sigaction) |old_sa| {
             // Restore the full original sigaction (handler, mask, and flags)
             var sa = old_sa;
-            posix.sigaction(posix.SIG.WINCH, &sa, null) catch {};
+            posix.sigaction(posix.SIG.WINCH, &sa, null);
             self.prev_sigaction = null;
         }
     }
 
     /// SIGWINCH signal handler
-    fn sigwinchHandler(_: c_int) callconv(.C) void {
+    fn sigwinchHandler(_: c_int) callconv(.c) void {
         resize_pending.store(true, .release);
     }
 
@@ -374,15 +377,15 @@ pub const PosixBackend = struct {
         var fds = [_]posix.pollfd{
             .{
                 .fd = self.tty_fd,
-                .events = .{ .IN = true },
-                .revents = .{},
+                .events = posix.POLL.IN,
+                .revents = 0,
             },
         };
 
         const timeout: i32 = if (timeout_ms) |ms| @intCast(ms) else -1;
         const result = try posix.poll(&fds, timeout);
 
-        if (result > 0 and fds[0].revents.IN) {
+        if (result > 0 and (fds[0].revents & posix.POLL.IN) != 0) {
             return 1; // Data available
         }
         return 0; // Timeout or no data

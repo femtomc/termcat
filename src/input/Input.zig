@@ -94,11 +94,9 @@ pub fn pollEvent(self: *Input, timeout_ms: ?u32) !?Event.Event {
             // Data available - read it
             const bytes_read = try self.readInput();
             if (bytes_read == 0) {
-                // EOF or would block - check timeout and return
-                if (timeout_ms != null and elapsed >= timeout_ms.?) {
-                    return null;
-                }
-                continue;
+                // poll() reported ready but read() returned 0
+                // This indicates EOF (TTY hangup, closed fd)
+                return error.EndOfStream;
             }
             // We read data, loop back to process it
             continue;
@@ -171,15 +169,15 @@ fn pollFd(self: *Input, timeout_ms: ?u32) !usize {
     var fds = [_]posix.pollfd{
         .{
             .fd = self.fd,
-            .events = .{ .IN = true },
-            .revents = .{},
+            .events = posix.POLL.IN,
+            .revents = 0,
         },
     };
 
     const timeout: i32 = if (timeout_ms) |ms| @intCast(ms) else -1;
     const result = try posix.poll(&fds, timeout);
 
-    if (result > 0 and fds[0].revents.IN) {
+    if (result > 0 and (fds[0].revents & posix.POLL.IN) != 0) {
         return 1;
     }
     return 0;
