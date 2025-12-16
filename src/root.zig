@@ -18,6 +18,7 @@ pub const Attributes = Cell.Attributes;
 pub const Buffer = @import("Buffer.zig");
 pub const Renderer = @import("Renderer.zig");
 pub const Plane = @import("Plane.zig");
+pub const Compositor = @import("Compositor.zig");
 
 // Unicode utilities
 pub const unicode = struct {
