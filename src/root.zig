@@ -45,6 +45,7 @@ pub const backend = struct {
     pub const posix = @import("backend/posix.zig");
     pub const pty = @import("backend/pty.zig");
     pub const posix_test = @import("backend/posix_test.zig");
+    pub const integration_test = @import("backend/integration_test.zig");
 
     pub const PosixBackend = posix.PosixBackend;
     pub const Pty = pty.Pty;
