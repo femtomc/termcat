@@ -2,26 +2,28 @@ const std = @import("std");
 const termcat = @import("termcat");
 
 pub fn main() !void {
-    // Prints to stderr, ignoring potential errors.
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
-    try termcat.bufferedPrint();
+    // Demo showing capability detection
+    const caps = termcat.detectCapabilities();
+
+    std.debug.print("Termcat - Terminal Capabilities\n", .{});
+    std.debug.print("================================\n", .{});
+    std.debug.print("Color depth: {s}\n", .{@tagName(caps.color_depth)});
+    std.debug.print("Mouse support: {}\n", .{caps.mouse});
+    std.debug.print("Bracketed paste: {}\n", .{caps.bracketed_paste});
+    std.debug.print("Focus events: {}\n", .{caps.focus_events});
+
+    if (std.posix.getenv("TERM")) |term| {
+        std.debug.print("TERM: {s}\n", .{term});
+    }
+    if (std.posix.getenv("COLORTERM")) |colorterm| {
+        std.debug.print("COLORTERM: {s}\n", .{colorterm});
+    }
 }
 
 test "simple test" {
     const gpa = std.testing.allocator;
     var list: std.ArrayList(i32) = .empty;
-    defer list.deinit(gpa); // Try commenting this out and see if zig detects the memory leak!
+    defer list.deinit(gpa);
     try list.append(gpa, 42);
     try std.testing.expectEqual(@as(i32, 42), list.pop());
-}
-
-test "fuzz example" {
-    const Context = struct {
-        fn testOne(context: @This(), input: []const u8) anyerror!void {
-            _ = context;
-            // Try passing `--fuzz` to `zig build test` and see if it manages to fail this test case!
-            try std.testing.expect(!std.mem.eql(u8, "canyoufindme", input));
-        }
-    };
-    try std.testing.fuzz(Context{}, Context.testOne, .{});
 }
