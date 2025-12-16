@@ -33,6 +33,12 @@ pub const Key = Event.Key;
 pub const Modifiers = Event.Modifiers;
 pub const Mouse = Event.Mouse;
 
+// Input handling
+pub const input = struct {
+    pub const Decoder = @import("input/decoder.zig");
+    pub const Input = @import("input/Input.zig");
+};
+
 // Backend
 pub const backend = struct {
     pub const posix = @import("backend/posix.zig");
@@ -49,6 +55,8 @@ pub const backend = struct {
 // Convenience re-exports for backend types
 pub const PosixBackend = backend.PosixBackend;
 pub const Pty = backend.Pty;
+pub const Input = input.Input;
+pub const Decoder = input.Decoder;
 pub const ColorDepth = backend.ColorDepth;
 pub const Capabilities = backend.Capabilities;
 pub const InitOptions = backend.InitOptions;

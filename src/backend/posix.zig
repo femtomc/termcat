@@ -2,6 +2,7 @@ const std = @import("std");
 const posix = std.posix;
 const Event = @import("../Event.zig");
 const Size = Event.Size;
+const Input = @import("../input/Input.zig");
 
 /// Color depth capability levels
 pub const ColorDepth = enum {
@@ -59,6 +60,8 @@ pub const PosixBackend = struct {
     output_buffer: std.ArrayList(u8),
     /// Previous SIGWINCH handler (stored per instance for safe restoration)
     prev_sigaction: ?posix.Sigaction,
+    /// Input handler for decoding terminal input
+    input_handler: Input,
 
     /// Atomic flag for SIGWINCH notification
     var resize_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
@@ -100,9 +103,11 @@ pub const PosixBackend = struct {
             .in_raw_mode = false,
             .output_buffer = std.ArrayList(u8).init(allocator),
             .prev_sigaction = null,
+            .input_handler = Input.init(allocator, tty_fd),
         };
 
         errdefer self.output_buffer.deinit();
+        errdefer self.input_handler.deinit();
 
         // Enter raw mode and set up terminal
         try self.enterRawMode();
@@ -142,6 +147,9 @@ pub const PosixBackend = struct {
 
         // Exit raw mode and restore terminal
         self.exitRawMode() catch {};
+
+        // Free input handler
+        self.input_handler.deinit();
 
         // Free output buffer
         self.output_buffer.deinit();
@@ -396,6 +404,32 @@ pub const PosixBackend = struct {
             error.WouldBlock => 0,
             else => err,
         };
+    }
+
+    /// Poll for an event with optional timeout (in milliseconds).
+    /// Returns null on timeout.
+    ///
+    /// This handles:
+    /// - SIGWINCH resize detection (returns resize event)
+    /// - Input decoding (keys, mouse, paste, focus)
+    /// - Escape sequence timeout for ambiguous sequences
+    ///
+    /// Event data lifetime: For paste events, the slice data is only valid
+    /// until the next call to pollEvent/peekEvent.
+    pub fn pollEvent(self: *Self, timeout_ms: ?u32) !?Event.Event {
+        // Check for pending resize first
+        if (self.checkResizePending()) {
+            self.size = try getTerminalSize(self.tty_fd);
+            return .{ .resize = self.size };
+        }
+
+        // Poll for input events
+        return self.input_handler.pollEvent(timeout_ms);
+    }
+
+    /// Non-blocking event check (equivalent to pollEvent(0))
+    pub fn peekEvent(self: *Self) !?Event.Event {
+        return self.pollEvent(0);
     }
 };
 
