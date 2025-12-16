@@ -19,6 +19,7 @@ pub const Buffer = @import("Buffer.zig");
 pub const Renderer = @import("Renderer.zig");
 pub const Plane = @import("Plane.zig");
 pub const Compositor = @import("Compositor.zig");
+pub const Blit = @import("Blit.zig");
 
 // Unicode utilities
 pub const unicode = struct {
