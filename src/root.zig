@@ -50,6 +50,7 @@ pub const backend = struct {
     pub const pty = @import("backend/pty.zig");
     pub const posix_test = @import("backend/posix_test.zig");
     pub const integration_test = @import("backend/integration_test.zig");
+    pub const compositor_test = @import("backend/compositor_test.zig");
 
     pub const PosixBackend = posix.PosixBackend;
     pub const WindowsBackend = windows.WindowsBackend;
