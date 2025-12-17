@@ -30,6 +30,8 @@ pub const InitOptions = struct {
     enable_bracketed_paste: bool = true,
     /// Enable focus event reporting
     enable_focus_events: bool = true,
+    /// Leave ISIG enabled so Ctrl+C/Ctrl+Z are handled by the terminal driver
+    enable_signals: bool = false,
 };
 
 /// Maximum number of concurrent backends that can receive resize notifications.
@@ -316,11 +318,11 @@ pub const PosixBackend = struct {
         raw.cflag.PARENB = false; // Disable parity
         raw.cflag.CSTOPB = false; // Single stop bit (not 2)
 
-        // Local flags: disable echo, canonical mode, signals, extended input
+        // Local flags: disable echo, canonical mode, extended input; optionally disable signals
         raw.lflag.ECHO = false;
         raw.lflag.ICANON = false;
         raw.lflag.IEXTEN = false;
-        raw.lflag.ISIG = false;
+        raw.lflag.ISIG = self.options.enable_signals;
 
         // Control chars: minimum 0 bytes, no timeout
         // Note: This makes read non-blocking - callers should use poll() first

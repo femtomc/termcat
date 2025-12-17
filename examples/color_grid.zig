@@ -26,6 +26,7 @@ pub fn main() !void {
     // Initialize terminal
     var backend = try termcat.PosixBackend.init(allocator, .{
         .enable_mouse = false,
+        .enable_signals = true,
     });
     defer backend.deinit();
 

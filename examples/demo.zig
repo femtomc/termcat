@@ -13,7 +13,7 @@ pub fn main() !void {
 
     // Initialize terminal with mouse support
     var term = try Terminal.init(allocator, .{
-        .backend = .{ .enable_mouse = true },
+        .backend = .{ .enable_mouse = true, .enable_signals = true },
     });
     defer term.deinit();
 

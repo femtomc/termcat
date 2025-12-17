@@ -21,6 +21,7 @@ pub fn main() !void {
         .enable_mouse = true,
         .enable_bracketed_paste = true,
         .enable_focus_events = true,
+        .enable_signals = true,
     });
     defer backend.deinit();
 
