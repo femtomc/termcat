@@ -5,14 +5,16 @@
 #
 # Arguments:
 #   issue-id  The beads issue ID (e.g., termcat-abc)
-#   commit    Optional commit SHA to review (defaults to HEAD~1 or uncommitted changes)
+#   commit    Optional commit SHA to review (defaults to HEAD or uncommitted changes)
 #
 # This script:
 # 1. Gets issue details and modified files automatically
 # 2. Spawns Codex, Gemini, and Claude reviewers in parallel
-# 3. Captures their stdout as review output
-# 4. Posts all reviews via `bd comment`
+# 3. Extracts structured JSON reviews from output
+# 4. Posts reviews via `bd comment` with type=review
 # 5. Shows aggregated verdict summary
+#
+# See docs/design/REVIEW_PROTOCOL.md for the full protocol specification.
 
 set -euo pipefail
 
@@ -24,7 +26,7 @@ if [[ $# -lt 1 ]]; then
 fi
 
 ISSUE_ID="$1"
-COMMIT="${2:-}"  # Optional commit SHA
+COMMIT_ARG="${2:-}"  # Optional commit SHA
 
 # Colors for output
 RED='\033[0;31m'
@@ -44,23 +46,29 @@ if [[ -z "$ISSUE_TITLE" ]]; then
 fi
 echo "Issue: $ISSUE_TITLE"
 
-# Get modified files
-echo -e "${YELLOW}Detecting modified files...${NC}"
+# Determine commit SHA and diff spec
+echo -e "${YELLOW}Detecting changes...${NC}"
 
-if [[ -n "$COMMIT" ]]; then
-    # Specific commit provided - diff that commit against its parent
-    MODIFIED_FILES=$(git diff --name-only "${COMMIT}^..${COMMIT}" 2>/dev/null || true)
-    DIFF_SPEC="${COMMIT}^..${COMMIT}"
-    echo "Reviewing commit: $COMMIT"
+if [[ -n "$COMMIT_ARG" ]]; then
+    # Specific commit provided
+    COMMIT_SHA="$COMMIT_ARG"
+    MODIFIED_FILES=$(git diff --name-only "${COMMIT_SHA}^..${COMMIT_SHA}" 2>/dev/null || true)
+    DIFF_SPEC="${COMMIT_SHA}^..${COMMIT_SHA}"
+    echo "Reviewing commit: $COMMIT_SHA"
 else
-    # No commit specified - check for uncommitted changes first
+    # Get current HEAD SHA
+    COMMIT_SHA=$(git rev-parse --short HEAD)
+
+    # Check for uncommitted changes first
     MODIFIED_FILES=$(git diff --name-only HEAD 2>/dev/null || true)
     DIFF_SPEC="HEAD"
+
     if [[ -z "$MODIFIED_FILES" ]]; then
-        # Try comparing to previous commit if working tree is clean
+        # Working tree clean - review last commit
         MODIFIED_FILES=$(git diff --name-only HEAD~1 2>/dev/null || true)
         DIFF_SPEC="HEAD~1"
     fi
+    echo "Review commit: $COMMIT_SHA"
 fi
 
 if [[ -z "$MODIFIED_FILES" ]]; then
@@ -69,8 +77,10 @@ if [[ -z "$MODIFIED_FILES" ]]; then
     exit 1
 fi
 
-# Format files as bullet list
+# Format files as bullet list and JSON array
 FILES_LIST=$(echo "$MODIFIED_FILES" | sed 's/^/- /')
+FILES_JSON=$(echo "$MODIFIED_FILES" | jq -R -s -c 'split("\n") | map(select(length > 0))')
+
 echo "Files to review:"
 echo "$FILES_LIST"
 echo ""
@@ -80,10 +90,49 @@ TEMP_DIR=$(mktemp -d)
 trap "rm -rf $TEMP_DIR" EXIT
 
 #############################################
+# STRUCTURED OUTPUT FORMAT
+# All reviewers use this same output format
+#############################################
+STRUCTURED_OUTPUT_INSTRUCTIONS='
+## Output Format
+
+After your analysis, output your review in the following EXACT format.
+The JSON must be valid and appear between the delimiters exactly as shown.
+
+=== BEADS_REVIEW_START ===
+{
+  "verdict": "LGTM" or "CHANGES_REQUESTED",
+  "reviewer": "<your-name>",
+  "issue_id": "'"$ISSUE_ID"'",
+  "commit": "'"$COMMIT_SHA"'",
+  "timestamp": "<current ISO-8601 timestamp>",
+  "summary": "<1-2 sentence summary of your review>",
+  "issues": [
+    {
+      "severity": "error|warning|info",
+      "file": "<path to file or null>",
+      "line": <line number or null>,
+      "message": "<description of the issue>",
+      "suggestion": "<how to fix it or null>"
+    }
+  ],
+  "files_reviewed": '"$FILES_JSON"'
+}
+=== BEADS_REVIEW_END ===
+
+IMPORTANT:
+- Use the exact issue_id ("'"$ISSUE_ID"'") and commit ("'"$COMMIT_SHA"'") values shown above
+- Set verdict to "LGTM" if no blocking issues, "CHANGES_REQUESTED" if there are errors/warnings
+- The issues array should be empty [] if verdict is LGTM
+- Output ONLY this JSON block as your final output
+- Everything before === BEADS_REVIEW_START === will be ignored by the review system
+'
+
+#############################################
 # CODEX REVIEW
 #############################################
 codex_review() {
-    local prompt='You are a senior code reviewer performing a rigorous review for issue '"$ISSUE_ID"': "'"$ISSUE_TITLE"'".
+    local prompt='You are a senior code reviewer performing a rigorous review for issue '"$ISSUE_ID"': "'"$ISSUE_TITLE"'" at commit '"$COMMIT_SHA"'.
 
 Files modified:
 '"$FILES_LIST"'
@@ -139,33 +188,15 @@ Adopt an ADVERSARIAL mindset. Your job is to find problems, not to approve code.
    - Are edge cases covered?
    - Do tests actually assert the right behavior?
    - Could tests pass while code is still broken?
-
-4. **Output your review**
-   After your analysis, output ONLY your review verdict and findings to stdout. Do not run any commands to post the review - just print it.
-
-   Format your output as:
-   - First line: "LGTM" or "CHANGES REQUESTED"
-   - Following lines: Your detailed findings, explanations, and reasoning
-
-   Example output:
-   LGTM
-
-   Verified the implementation handles all edge cases correctly...
-
-   OR:
-
-   CHANGES REQUESTED
-
-   Found the following issues:
-   1. Off-by-one error in line 42...'
+'"$STRUCTURED_OUTPUT_INSTRUCTIONS"
 
     echo -e "${BLUE}[CODEX]${NC} Starting review..." >&2
-    if codex exec --dangerously-bypass-approvals-and-sandbox "$prompt" > "$TEMP_DIR/codex_output.txt" 2>"$TEMP_DIR/codex.log"; then
+    if codex exec --dangerously-bypass-approvals-and-sandbox "$prompt" \
+        > "$TEMP_DIR/codex_output.txt" \
+        2> >(while IFS= read -r line; do echo "[CODEX] $line" >&2; done); then
         echo -e "${GREEN}[CODEX]${NC} Review complete" >&2
     else
         echo -e "${RED}[CODEX]${NC} Review failed (exit code $?)" >&2
-        cat "$TEMP_DIR/codex.log" >&2
-        echo "REVIEW FAILED - Codex exited with error" > "$TEMP_DIR/codex_output.txt"
     fi
 }
 
@@ -173,7 +204,7 @@ Adopt an ADVERSARIAL mindset. Your job is to find problems, not to approve code.
 # GEMINI REVIEW
 #############################################
 gemini_review() {
-    local prompt='You are a senior code reviewer performing a rigorous review for issue '"$ISSUE_ID"': "'"$ISSUE_TITLE"'".
+    local prompt='You are a senior code reviewer performing a rigorous review for issue '"$ISSUE_ID"': "'"$ISSUE_TITLE"'" at commit '"$COMMIT_SHA"'.
 
 Files modified:
 '"$FILES_LIST"'
@@ -245,21 +276,15 @@ Be DEEPLY SKEPTICAL. Your purpose is to catch mistakes before they reach product
    - Are boundary conditions tested?
    - Could a buggy implementation still pass these tests?
    - Are assertions checking the right things?
-
-4. **Output your review**
-   After your analysis, output ONLY your review verdict and findings. Do not run any commands to post the review.
-
-   Format your output as:
-   - First line: "LGTM" or "CHANGES REQUESTED"
-   - Following lines: Your detailed findings, explanations, and reasoning'
+'"$STRUCTURED_OUTPUT_INSTRUCTIONS"
 
     echo -e "${BLUE}[GEMINI]${NC} Starting review..." >&2
-    if gemini --model gemini-3-pro-preview --allowed-tools read_file,glob,search_file_content,list_directory,run_shell_command "$prompt" > "$TEMP_DIR/gemini_output.txt" 2>"$TEMP_DIR/gemini.log"; then
+    if gemini --model gemini-3-pro-preview --allowed-tools read_file,glob,search_file_content,list_directory,run_shell_command "$prompt" \
+        > "$TEMP_DIR/gemini_output.txt" \
+        2> >(while IFS= read -r line; do echo "[GEMINI] $line" >&2; done); then
         echo -e "${GREEN}[GEMINI]${NC} Review complete" >&2
     else
         echo -e "${RED}[GEMINI]${NC} Review failed (exit code $?)" >&2
-        cat "$TEMP_DIR/gemini.log" >&2
-        echo "REVIEW FAILED - Gemini exited with error" > "$TEMP_DIR/gemini_output.txt"
     fi
 }
 
@@ -267,7 +292,7 @@ Be DEEPLY SKEPTICAL. Your purpose is to catch mistakes before they reach product
 # CLAUDE REVIEW (Design/Organization)
 #############################################
 claude_review() {
-    local prompt='You are a senior architect reviewing code organization for issue '"$ISSUE_ID"': "'"$ISSUE_TITLE"'".
+    local prompt='You are a senior architect reviewing code organization for issue '"$ISSUE_ID"': "'"$ISSUE_TITLE"'" at commit '"$COMMIT_SHA"'.
 
 Files modified:
 '"$FILES_LIST"'
@@ -325,22 +350,159 @@ Focus on SOFTWARE DESIGN, not correctness. Assume the code works—your job is t
    **Code Duplication:**
    - Is there copy-paste that should be extracted?
    - Conversely, is there forced reuse that hurts clarity?
-
-3. **Output your review**
-   After your analysis, output ONLY your review verdict and findings. Do not run any commands to post the review.
-
-   Format your output as:
-   - First line: "LGTM" or "CHANGES REQUESTED"
-   - Following lines: Your detailed findings, explanations, and reasoning'
+'"$STRUCTURED_OUTPUT_INSTRUCTIONS"
 
     echo -e "${BLUE}[CLAUDE]${NC} Starting review..." >&2
-    if claude --dangerously-skip-permissions "$prompt" > "$TEMP_DIR/claude_output.txt" 2>"$TEMP_DIR/claude.log"; then
+    if claude --dangerously-skip-permissions "$prompt" \
+        > "$TEMP_DIR/claude_output.txt" \
+        2> >(while IFS= read -r line; do echo "[CLAUDE] $line" >&2; done); then
         echo -e "${GREEN}[CLAUDE]${NC} Review complete" >&2
     else
         echo -e "${RED}[CLAUDE]${NC} Review failed (exit code $?)" >&2
-        cat "$TEMP_DIR/claude.log" >&2
-        echo "REVIEW FAILED - Claude exited with error" > "$TEMP_DIR/claude_output.txt"
     fi
+}
+
+#############################################
+# EXTRACTION FUNCTIONS
+#############################################
+
+# Extract JSON from noisy output
+# IMPORTANT: Models often echo the format in thinking, producing multiple blocks.
+# We find the LAST VALID start/end pair (where end comes after start).
+extract_review_json() {
+    local output_file="$1"
+
+    if [[ ! -f "$output_file" ]] || [[ ! -s "$output_file" ]]; then
+        return 1
+    fi
+
+    # Find line numbers of all delimiter pairs
+    local starts_str ends_str
+    starts_str=$(grep -n '=== BEADS_REVIEW_START ===' "$output_file" 2>/dev/null | cut -d: -f1 || true)
+    ends_str=$(grep -n '=== BEADS_REVIEW_END ===' "$output_file" 2>/dev/null | cut -d: -f1 || true)
+
+    if [[ -z "$starts_str" || -z "$ends_str" ]]; then
+        return 1  # No delimiters found
+    fi
+
+    # Find the last VALID pair: iterate ends in reverse, find matching start
+    # A valid pair has start < end with no other start in between
+    local best_start="" best_end=""
+
+    # Convert to arrays (bash 3.2 compatible)
+    local ends_arr=()
+    while IFS= read -r line; do
+        ends_arr+=("$line")
+    done <<< "$ends_str"
+
+    local starts_arr=()
+    while IFS= read -r line; do
+        starts_arr+=("$line")
+    done <<< "$starts_str"
+
+    # Iterate ends from last to first
+    local i=${#ends_arr[@]}
+    while [[ $i -gt 0 ]]; do
+        ((i--))
+        local end_line="${ends_arr[$i]}"
+
+        # Find the closest start that comes before this end
+        local j=${#starts_arr[@]}
+        while [[ $j -gt 0 ]]; do
+            ((j--))
+            local start_line="${starts_arr[$j]}"
+            if [[ $start_line -lt $end_line ]]; then
+                best_start="$start_line"
+                best_end="$end_line"
+                break 2  # Found valid pair, exit both loops
+            fi
+        done
+    done
+
+    if [[ -z "$best_start" || -z "$best_end" ]]; then
+        return 1  # No valid pair found
+    fi
+
+    # Extract lines between delimiters (exclusive of delimiters)
+    local json_lines
+    json_lines=$(sed -n "$((best_start + 1)),$((best_end - 1))p" "$output_file")
+
+    # Validate JSON and normalize
+    if echo "$json_lines" | jq -c '.' 2>/dev/null; then
+        return 0
+    else
+        return 1  # JSON parse failed
+    fi
+}
+
+# Create a canonical FAILED review when extraction fails
+create_failed_review() {
+    local reviewer="$1"
+    local reason="$2"
+    local output_file="$3"
+
+    # Capture last 50 lines of output for debugging (truncate to 2000 chars)
+    local tail_output=""
+    if [[ -f "$output_file" ]]; then
+        tail_output=$(tail -50 "$output_file" 2>/dev/null | head -c 2000 || true)
+    fi
+
+    # Generate canonical FAILED review JSON
+    jq -n \
+        --arg verdict "FAILED" \
+        --arg reviewer "$reviewer" \
+        --arg issue_id "$ISSUE_ID" \
+        --arg commit "$COMMIT_SHA" \
+        --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --arg summary "Review extraction failed: $reason" \
+        --arg error_output "$tail_output" \
+        --argjson files_reviewed "$FILES_JSON" \
+        '{
+            verdict: $verdict,
+            reviewer: $reviewer,
+            issue_id: $issue_id,
+            commit: $commit,
+            timestamp: $timestamp,
+            summary: $summary,
+            issues: [],
+            files_reviewed: $files_reviewed,
+            error_output: $error_output
+        }'
+}
+
+# Post review to beads and return verdict
+post_review() {
+    local name="$1"
+    local reviewer_id="$2"
+    local output_file="$3"
+
+    local json verdict
+
+    if json=$(extract_review_json "$output_file"); then
+        # Successful extraction
+        verdict=$(echo "$json" | jq -r '.verdict')
+
+        # Post as structured comment with review prefix
+        # NOTE: --type=review flag is a Phase 2 feature requiring beads changes
+        # For now, we use a parseable prefix format: [REVIEW:<reviewer>] <json>
+        if bd comment "$ISSUE_ID" "[REVIEW:$reviewer_id] $json" >&2; then
+            echo -e "  ${GREEN}✓${NC} Posted $name review ($verdict)" >&2
+        else
+            echo -e "  ${RED}✗${NC} Failed to post $name review" >&2
+        fi
+    else
+        # Extraction failed - create canonical FAILED review
+        verdict="FAILED"
+        json=$(create_failed_review "$reviewer_id" "No valid JSON block found in output" "$output_file")
+
+        if bd comment "$ISSUE_ID" "[REVIEW:$reviewer_id] $json" >&2; then
+            echo -e "  ${YELLOW}⚠${NC} Posted $name review (FAILED - extraction error)" >&2
+        else
+            echo -e "  ${RED}✗${NC} Failed to post $name review" >&2
+        fi
+    fi
+
+    echo "$verdict"
 }
 
 #############################################
@@ -366,79 +528,31 @@ echo "  Gemini PID: $GEMINI_PID"
 echo "  Claude PID: $CLAUDE_PID"
 echo ""
 
-wait $CODEX_PID
-wait $GEMINI_PID
-wait $CLAUDE_PID
+wait $CODEX_PID || true
+wait $GEMINI_PID || true
+wait $CLAUDE_PID || true
 
 echo ""
 echo -e "${YELLOW}Posting reviews...${NC}"
 
-# Helper to extract verdict from review output
-# Looks for exact match of "LGTM" or "CHANGES REQUESTED" on the first non-empty line
-get_verdict() {
-    local file="$1"
-    if [[ ! -f "$file" ]]; then
-        echo "FAILED"
-        return
-    fi
-
-    # Get first non-empty line, trimmed, uppercased (tr for portability)
-    local first_line
-    first_line=$(grep -m1 -v '^[[:space:]]*$' "$file" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr '[:lower:]' '[:upper:]')
-
-    # Exact match
-    if [[ "$first_line" == "LGTM" ]]; then
-        echo "LGTM"
-    elif [[ "$first_line" == "CHANGES REQUESTED" ]]; then
-        echo "CHANGES REQUESTED"
-    else
-        echo "UNKNOWN"
-    fi
-}
-
-# Post a review, showing errors if posting fails
-# Prints status to stderr, verdict to stdout (for capture)
-post_review() {
-    local name="$1"
-    local output_file="$2"
-    local prefix="$3"
-
-    if [[ ! -f "$output_file" ]] || [[ ! -s "$output_file" ]]; then
-        echo -e "  ${RED}✗${NC} $name review output missing or empty" >&2
-        echo "FAILED"
-        return
-    fi
-
-    local verdict
-    verdict=$(get_verdict "$output_file")
-    local review_content
-    review_content=$(cat "$output_file")
-
-    if bd comment "$ISSUE_ID" "$prefix$review_content" >&2; then
-        echo -e "  ${GREEN}✓${NC} Posted $name review ($verdict)" >&2
-    else
-        echo -e "  ${RED}✗${NC} Failed to post $name review (bd comment error above)" >&2
-    fi
-    echo "$verdict"
-}
-
-CODEX_VERDICT=$(post_review "Codex" "$TEMP_DIR/codex_output.txt" "CODEX REVIEW: ")
-GEMINI_VERDICT=$(post_review "Gemini" "$TEMP_DIR/gemini_output.txt" "GEMINI REVIEW: ")
-CLAUDE_VERDICT=$(post_review "Claude" "$TEMP_DIR/claude_output.txt" "CLAUDE REVIEW (DESIGN): ")
+CODEX_VERDICT=$(post_review "Codex" "codex" "$TEMP_DIR/codex_output.txt")
+GEMINI_VERDICT=$(post_review "Gemini" "gemini" "$TEMP_DIR/gemini_output.txt")
+CLAUDE_VERDICT=$(post_review "Claude" "claude" "$TEMP_DIR/claude_output.txt")
 
 echo ""
-echo -e "${BLUE}=== Review Summary ===${NC}"
+echo -e "${BLUE}=== Review Summary (commit $COMMIT_SHA) ===${NC}"
 
 # Count verdicts
 LGTM_COUNT=0
 CHANGES_COUNT=0
+FAILED_COUNT=0
 
 for verdict in "$CODEX_VERDICT" "$GEMINI_VERDICT" "$CLAUDE_VERDICT"; do
-    if [[ "$verdict" == "LGTM" ]]; then
-        ((LGTM_COUNT++))
-    elif [[ "$verdict" == "CHANGES REQUESTED" ]]; then
-        ((CHANGES_COUNT++))
-    fi
+    case "$verdict" in
+        LGTM) ((LGTM_COUNT++)) ;;
+        CHANGES_REQUESTED) ((CHANGES_COUNT++)) ;;
+        FAILED) ((FAILED_COUNT++)) ;;
+    esac
 done
 
 echo -e "  Codex:  $CODEX_VERDICT"
@@ -448,15 +562,18 @@ echo ""
 
 if [[ $LGTM_COUNT -eq 3 ]]; then
     echo -e "${GREEN}All three reviewers approved! Ready to commit.${NC}"
-elif [[ $CHANGES_COUNT -gt 0 ]]; then
-    echo -e "${YELLOW}$CHANGES_COUNT reviewer(s) requested changes. Address feedback and re-run:${NC}"
+    exit 0
+elif [[ $FAILED_COUNT -gt 0 ]]; then
+    echo -e "${RED}$FAILED_COUNT review(s) failed to complete. Check output and re-run:${NC}"
     echo "   ./scripts/triple-review.sh $ISSUE_ID"
+    exit 1
+elif [[ $CHANGES_COUNT -gt 0 ]]; then
+    echo -e "${YELLOW}$CHANGES_COUNT reviewer(s) requested changes.${NC}"
+    echo ""
+    echo "View details with: bd comments $ISSUE_ID"
+    echo "Re-run after fixes: ./scripts/triple-review.sh $ISSUE_ID"
+    exit 1
 else
-    echo -e "${YELLOW}Some reviews may have failed or returned unexpected output.${NC}"
-    echo "Check the review details below."
+    echo -e "${YELLOW}Unexpected review state. Check the output files.${NC}"
+    exit 1
 fi
-
-echo ""
-echo -e "${YELLOW}Full review details:${NC}"
-echo ""
-bd show "$ISSUE_ID"
