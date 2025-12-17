@@ -103,6 +103,8 @@ var original_sigaction_valid: bool = false;
 pub const PosixBackend = struct {
     /// File descriptor for the terminal
     tty_fd: posix.fd_t,
+    /// File descriptor used for input polling/reads
+    input_fd: posix.fd_t,
     /// Whether we own the fd (and should close it on deinit)
     owns_fd: bool,
     /// Original terminal attributes (for restoration)
@@ -209,8 +211,12 @@ pub const PosixBackend = struct {
             posix.close(p[1]);
         };
 
+        // Use stdin for input when it's a TTY (avoids poll() quirks on /dev/tty on macOS)
+        const input_fd: posix.fd_t = if (posix.isatty(posix.STDIN_FILENO)) posix.STDIN_FILENO else tty_fd;
+
         var self = Self{
             .tty_fd = tty_fd,
+            .input_fd = input_fd,
             .owns_fd = owns_fd,
             .orig_termios = orig_termios,
             .size = size,
@@ -219,7 +225,7 @@ pub const PosixBackend = struct {
             .in_raw_mode = false,
             .allocator = allocator,
             .output_buffer = .empty,
-            .input_handler = Input.init(allocator, tty_fd),
+            .input_handler = Input.init(allocator, input_fd),
             .resize_pipe = resize_pipe,
             .resize_slot = resize_slot,
         };
@@ -536,7 +542,7 @@ pub const PosixBackend = struct {
     pub fn poll(self: *Self, timeout_ms: ?u32) !usize {
         var fds = [_]posix.pollfd{
             .{
-                .fd = self.tty_fd,
+                .fd = self.input_fd,
                 .events = posix.POLL.IN,
                 .revents = 0,
             },
@@ -555,7 +561,7 @@ pub const PosixBackend = struct {
     /// Note: This function is non-blocking. Always call poll() first to check
     /// for available data, otherwise you may get 0 bytes.
     pub fn read(self: *Self, buf: []u8) !usize {
-        return posix.read(self.tty_fd, buf) catch |err| switch (err) {
+        return posix.read(self.input_fd, buf) catch |err| switch (err) {
             error.WouldBlock => 0,
             else => err,
         };
