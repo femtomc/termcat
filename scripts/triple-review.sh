@@ -124,17 +124,32 @@ Adopt an ADVERSARIAL mindset. Your job is to find problems, not to approve code.
    - Do tests actually assert the right behavior?
    - Could tests pass while code is still broken?
 
-4. **Write your review**
-   Think carefully, then write your findings:
-   - If issues found: `bd comment '"$ISSUE_ID"' "CODEX REVIEW: CHANGES REQUESTED\n\n<detailed findings with specific line references and explanations>"`
-   - If genuinely no issues after deep analysis: `bd comment '"$ISSUE_ID"' "CODEX REVIEW: LGTM\n\n<summary of what you verified and why you are confident>"`'
+4. **Output your review**
+   After your analysis, output ONLY your review verdict and findings to stdout. Do not run any commands to post the review - just print it.
+
+   Format your output as:
+   - First line: "LGTM" or "CHANGES REQUESTED"
+   - Following lines: Your detailed findings, explanations, and reasoning
+
+   Example output:
+   LGTM
+
+   Verified the implementation handles all edge cases correctly...
+
+   OR:
+
+   CHANGES REQUESTED
+
+   Found the following issues:
+   1. Off-by-one error in line 42...'
 
     echo -e "${BLUE}[CODEX]${NC} Starting review..." >&2
-    if codex exec --dangerously-bypass-approvals-and-sandbox "$prompt" > "$TEMP_DIR/codex.log" 2>&1; then
+    if codex exec --dangerously-bypass-approvals-and-sandbox "$prompt" > "$TEMP_DIR/codex_output.txt" 2>"$TEMP_DIR/codex.log"; then
         echo -e "${GREEN}[CODEX]${NC} Review complete" >&2
     else
         echo -e "${RED}[CODEX]${NC} Review failed (exit code $?)" >&2
         cat "$TEMP_DIR/codex.log" >&2
+        echo "REVIEW FAILED - Codex exited with error" > "$TEMP_DIR/codex_output.txt"
     fi
 }
 
@@ -160,7 +175,6 @@ Files modified:
 - Use `read_file` to read file contents
 - Use `glob` and `search_file_content` to find and search files
 - Run `git diff`, `git status`, `git log` via shell
-- Run `bd comment` to post your review
 - Run `bd show` to read issue details
 
 If you find yourself wanting to fix something, STOP. Your job is to report issues, not fix them.
@@ -216,17 +230,20 @@ Be DEEPLY SKEPTICAL. Your purpose is to catch mistakes before they reach product
    - Could a buggy implementation still pass these tests?
    - Are assertions checking the right things?
 
-4. **Deliver your verdict**
-   After thorough analysis:
-   - If problems found: `bd comment '"$ISSUE_ID"' "GEMINI REVIEW: CHANGES REQUESTED\n\n<specific issues with file:line references and clear explanations>"`
-   - If confident after deep review: `bd comment '"$ISSUE_ID"' "GEMINI REVIEW: LGTM\n\n<explanation of what you verified and your reasoning>"`'
+4. **Output your review**
+   After your analysis, output ONLY your review verdict and findings. Do not run any commands to post the review.
+
+   Format your output as:
+   - First line: "LGTM" or "CHANGES REQUESTED"
+   - Following lines: Your detailed findings, explanations, and reasoning'
 
     echo -e "${BLUE}[GEMINI]${NC} Starting review..." >&2
-    if gemini --model gemini-3-pro-preview --allowed-tools read_file,glob,search_file_content,list_directory,run_shell_command "$prompt" > "$TEMP_DIR/gemini.log" 2>&1; then
+    if gemini --model gemini-3-pro-preview --allowed-tools read_file,glob,search_file_content,list_directory,run_shell_command "$prompt" > "$TEMP_DIR/gemini_output.txt" 2>"$TEMP_DIR/gemini.log"; then
         echo -e "${GREEN}[GEMINI]${NC} Review complete" >&2
     else
         echo -e "${RED}[GEMINI]${NC} Review failed (exit code $?)" >&2
         cat "$TEMP_DIR/gemini.log" >&2
+        echo "REVIEW FAILED - Gemini exited with error" > "$TEMP_DIR/gemini_output.txt"
     fi
 }
 
@@ -250,7 +267,6 @@ Files modified:
 **YOU MAY ONLY:**
 - Read files to understand code structure
 - Run `git diff`, `git status`, `git log`
-- Run `bd comment` to post your review
 - Run `bd show` to read issue details
 
 ## Your Mindset
@@ -294,17 +310,20 @@ Focus on SOFTWARE DESIGN, not correctness. Assume the code works—your job is t
    - Is there copy-paste that should be extracted?
    - Conversely, is there forced reuse that hurts clarity?
 
-3. **Deliver your verdict**
-   After thorough analysis:
-   - If design issues found: `bd comment '"$ISSUE_ID"' "CLAUDE REVIEW (DESIGN): CHANGES REQUESTED\n\n<specific issues with suggestions for restructuring>"`
-   - If design is sound: `bd comment '"$ISSUE_ID"' "CLAUDE REVIEW (DESIGN): LGTM\n\n<summary of what makes the design good>"`'
+3. **Output your review**
+   After your analysis, output ONLY your review verdict and findings. Do not run any commands to post the review.
+
+   Format your output as:
+   - First line: "LGTM" or "CHANGES REQUESTED"
+   - Following lines: Your detailed findings, explanations, and reasoning'
 
     echo -e "${BLUE}[CLAUDE]${NC} Starting review..." >&2
-    if claude --dangerously-skip-permissions "$prompt" > "$TEMP_DIR/claude.log" 2>&1; then
+    if claude --dangerously-skip-permissions "$prompt" > "$TEMP_DIR/claude_output.txt" 2>"$TEMP_DIR/claude.log"; then
         echo -e "${GREEN}[CLAUDE]${NC} Review complete" >&2
     else
         echo -e "${RED}[CLAUDE]${NC} Review failed (exit code $?)" >&2
         cat "$TEMP_DIR/claude.log" >&2
+        echo "REVIEW FAILED - Claude exited with error" > "$TEMP_DIR/claude_output.txt"
     fi
 }
 
@@ -341,37 +360,92 @@ wait $CLAUDE_PID
 CLAUDE_STATUS=$?
 
 echo ""
+echo -e "${YELLOW}Posting reviews...${NC}"
+
+# Helper to extract verdict from review output
+get_verdict() {
+    local file="$1"
+    if [[ -f "$file" ]]; then
+        # Look for LGTM or CHANGES REQUESTED in first few lines
+        if head -5 "$file" | grep -qi "LGTM"; then
+            echo "LGTM"
+        elif head -5 "$file" | grep -qi "CHANGES REQUESTED"; then
+            echo "CHANGES REQUESTED"
+        else
+            echo "UNKNOWN"
+        fi
+    else
+        echo "FAILED"
+    fi
+}
+
+# Post Codex review
+CODEX_VERDICT="FAILED"
+if [[ -f "$TEMP_DIR/codex_output.txt" ]] && [[ -s "$TEMP_DIR/codex_output.txt" ]]; then
+    CODEX_VERDICT=$(get_verdict "$TEMP_DIR/codex_output.txt")
+    CODEX_REVIEW=$(cat "$TEMP_DIR/codex_output.txt")
+    bd comment "$ISSUE_ID" "CODEX REVIEW: $CODEX_REVIEW" 2>/dev/null && \
+        echo -e "  ${GREEN}✓${NC} Posted Codex review ($CODEX_VERDICT)" || \
+        echo -e "  ${RED}✗${NC} Failed to post Codex review"
+else
+    echo -e "  ${RED}✗${NC} Codex review output missing or empty"
+fi
+
+# Post Gemini review
+GEMINI_VERDICT="FAILED"
+if [[ -f "$TEMP_DIR/gemini_output.txt" ]] && [[ -s "$TEMP_DIR/gemini_output.txt" ]]; then
+    GEMINI_VERDICT=$(get_verdict "$TEMP_DIR/gemini_output.txt")
+    GEMINI_REVIEW=$(cat "$TEMP_DIR/gemini_output.txt")
+    bd comment "$ISSUE_ID" "GEMINI REVIEW: $GEMINI_REVIEW" 2>/dev/null && \
+        echo -e "  ${GREEN}✓${NC} Posted Gemini review ($GEMINI_VERDICT)" || \
+        echo -e "  ${RED}✗${NC} Failed to post Gemini review"
+else
+    echo -e "  ${RED}✗${NC} Gemini review output missing or empty"
+fi
+
+# Post Claude review
+CLAUDE_VERDICT="FAILED"
+if [[ -f "$TEMP_DIR/claude_output.txt" ]] && [[ -s "$TEMP_DIR/claude_output.txt" ]]; then
+    CLAUDE_VERDICT=$(get_verdict "$TEMP_DIR/claude_output.txt")
+    CLAUDE_REVIEW=$(cat "$TEMP_DIR/claude_output.txt")
+    bd comment "$ISSUE_ID" "CLAUDE REVIEW (DESIGN): $CLAUDE_REVIEW" 2>/dev/null && \
+        echo -e "  ${GREEN}✓${NC} Posted Claude review ($CLAUDE_VERDICT)" || \
+        echo -e "  ${RED}✗${NC} Failed to post Claude review"
+else
+    echo -e "  ${RED}✗${NC} Claude review output missing or empty"
+fi
+
+echo ""
 echo -e "${BLUE}=== Review Summary ===${NC}"
 
-# Report status
-if [[ $CODEX_STATUS -eq 0 ]]; then
-    echo -e "  ${GREEN}✓${NC} Codex review completed"
-else
-    echo -e "  ${RED}✗${NC} Codex review failed"
-fi
+# Count verdicts
+LGTM_COUNT=0
+CHANGES_COUNT=0
 
-if [[ $GEMINI_STATUS -eq 0 ]]; then
-    echo -e "  ${GREEN}✓${NC} Gemini review completed"
-else
-    echo -e "  ${RED}✗${NC} Gemini review failed"
-fi
+for verdict in "$CODEX_VERDICT" "$GEMINI_VERDICT" "$CLAUDE_VERDICT"; do
+    if [[ "$verdict" == "LGTM" ]]; then
+        ((LGTM_COUNT++))
+    elif [[ "$verdict" == "CHANGES REQUESTED" ]]; then
+        ((CHANGES_COUNT++))
+    fi
+done
 
-if [[ $CLAUDE_STATUS -eq 0 ]]; then
-    echo -e "  ${GREEN}✓${NC} Claude review completed"
+echo -e "  Codex:  $CODEX_VERDICT"
+echo -e "  Gemini: $GEMINI_VERDICT"
+echo -e "  Claude: $CLAUDE_VERDICT"
+echo ""
+
+if [[ $LGTM_COUNT -eq 3 ]]; then
+    echo -e "${GREEN}All three reviewers approved! Ready to commit.${NC}"
+elif [[ $CHANGES_COUNT -gt 0 ]]; then
+    echo -e "${YELLOW}$CHANGES_COUNT reviewer(s) requested changes. Address feedback and re-run:${NC}"
+    echo "   ./scripts/triple-review.sh $ISSUE_ID"
 else
-    echo -e "  ${RED}✗${NC} Claude review failed"
+    echo -e "${YELLOW}Some reviews may have failed or returned unexpected output.${NC}"
+    echo "Check the review details below."
 fi
 
 echo ""
-echo -e "${YELLOW}Fetching review comments...${NC}"
+echo -e "${YELLOW}Full review details:${NC}"
 echo ""
-
-# Show the issue with all comments
 bd show "$ISSUE_ID"
-
-echo ""
-echo -e "${BLUE}=== Next Steps ===${NC}"
-echo "1. Read the reviews above"
-echo "2. If any reviewer requested changes, address them and re-run:"
-echo "   ./scripts/triple-review.sh $ISSUE_ID"
-echo "3. If all three say LGTM, proceed to commit"
