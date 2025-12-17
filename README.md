@@ -276,4 +276,4 @@ zig build -Doptimize=ReleaseFast
 
 ## License
 
-MIT
+MIT - See [LICENSE](LICENSE) for details.
