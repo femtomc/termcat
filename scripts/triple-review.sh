@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # triple-review.sh - Run all three code reviewers in parallel
 #
-# Usage: ./scripts/triple-review.sh <issue-id>
+# Usage: ./scripts/triple-review.sh <issue-id> [commit]
+#
+# Arguments:
+#   issue-id  The beads issue ID (e.g., termcat-abc)
+#   commit    Optional commit SHA to review (defaults to HEAD~1 or uncommitted changes)
 #
 # This script:
 # 1. Gets issue details and modified files automatically
@@ -13,12 +17,14 @@
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
-    echo "Usage: $0 <issue-id>"
+    echo "Usage: $0 <issue-id> [commit]"
     echo "Example: $0 termcat-abc"
+    echo "Example: $0 termcat-abc abc1234  # review specific commit"
     exit 1
 fi
 
 ISSUE_ID="$1"
+COMMIT="${2:-}"  # Optional commit SHA
 
 # Colors for output
 RED='\033[0;31m'
@@ -38,12 +44,23 @@ if [[ -z "$ISSUE_TITLE" ]]; then
 fi
 echo "Issue: $ISSUE_TITLE"
 
-# Get modified files (staged + unstaged vs HEAD, or vs HEAD~1 if nothing staged)
+# Get modified files
 echo -e "${YELLOW}Detecting modified files...${NC}"
-MODIFIED_FILES=$(git diff --name-only HEAD 2>/dev/null || true)
-if [[ -z "$MODIFIED_FILES" ]]; then
-    # Try comparing to previous commit if working tree is clean
-    MODIFIED_FILES=$(git diff --name-only HEAD~1 2>/dev/null || true)
+
+if [[ -n "$COMMIT" ]]; then
+    # Specific commit provided - diff that commit against its parent
+    MODIFIED_FILES=$(git diff --name-only "${COMMIT}^..${COMMIT}" 2>/dev/null || true)
+    DIFF_SPEC="${COMMIT}^..${COMMIT}"
+    echo "Reviewing commit: $COMMIT"
+else
+    # No commit specified - check for uncommitted changes first
+    MODIFIED_FILES=$(git diff --name-only HEAD 2>/dev/null || true)
+    DIFF_SPEC="HEAD"
+    if [[ -z "$MODIFIED_FILES" ]]; then
+        # Try comparing to previous commit if working tree is clean
+        MODIFIED_FILES=$(git diff --name-only HEAD~1 2>/dev/null || true)
+        DIFF_SPEC="HEAD~1"
+    fi
 fi
 
 if [[ -z "$MODIFIED_FILES" ]]; then
@@ -78,7 +95,7 @@ Adopt an ADVERSARIAL mindset. Your job is to find problems, not to approve code.
 ## Your Process
 
 1. **Understand the context deeply**
-   - Run `git diff HEAD~1` (or `git diff` if uncommitted) to see the changes
+   - Run `git diff '"$DIFF_SPEC"'` to see the changes
    - Read the FULL content of each modified file, not just the diff
    - Understand how this code integrates with the rest of the system
    - Read `.claude/ZIG_STYLE.md` to understand project conventions
@@ -185,7 +202,7 @@ Be DEEPLY SKEPTICAL. Your purpose is to catch mistakes before they reach product
 ## Your Process
 
 1. **Build complete understanding first**
-   - Run `git diff HEAD~1` (or `git diff` if uncommitted) to see the changes
+   - Run `git diff '"$DIFF_SPEC"'` to see the changes
    - Read the ENTIRE content of each modified file for full context
    - Understand the problem being solved and whether this solution is appropriate
    - Check `.claude/ZIG_STYLE.md` for project conventions
@@ -275,7 +292,7 @@ Focus on SOFTWARE DESIGN, not correctness. Assume the code works—your job is t
 ## Your Process
 
 1. **Understand the change in context**
-   - Run `git diff HEAD~1` (or `git diff` if uncommitted) to see what changed
+   - Run `git diff '"$DIFF_SPEC"'` to see what changed
    - Read the full modified files to understand structure
    - Look at surrounding code to understand existing patterns
    - Check `.claude/ZIG_STYLE.md` for project conventions
