@@ -214,7 +214,9 @@ fn renderDiff(self: *Renderer, writer: anytype) !void {
     }
 }
 
-/// Emit attribute/color change sequences
+/// Emit attribute/color change sequences using delta-based optimization.
+/// Only emits the minimal escape sequences needed to transition from the
+/// previous state to the new state.
 fn emitAttributeChanges(
     self: *Renderer,
     writer: anytype,
@@ -231,24 +233,56 @@ fn emitAttributeChanges(
         return;
     }
 
-    // For simplicity, reset and re-apply all attributes on any change
-    // A more optimized version would emit only the delta
-    try writer.writeAll("\x1b[0m");
+    // Delta-based attribute updates
+    if (need_attr_change) {
+        // On first render (last_attrs is null), emit a full reset to clear any
+        // stale terminal attributes inherited from the shell prompt or prior state.
+        // This establishes a clean baseline before applying the new attributes.
+        if (last_attrs.* == null) {
+            try writer.writeAll("\x1b[0m");
+        }
 
-    // Apply attributes
-    if (cell.attrs.bold) try writer.writeAll("\x1b[1m");
-    if (cell.attrs.dim) try writer.writeAll("\x1b[2m");
-    if (cell.attrs.italic) try writer.writeAll("\x1b[3m");
-    if (cell.attrs.underline) try writer.writeAll("\x1b[4m");
-    if (cell.attrs.blink) try writer.writeAll("\x1b[5m");
-    if (cell.attrs.reverse) try writer.writeAll("\x1b[7m");
-    if (cell.attrs.strikethrough) try writer.writeAll("\x1b[9m");
+        const old_attrs = last_attrs.* orelse Attributes{};
+        const new_attrs = cell.attrs;
 
-    // Apply foreground color
-    try self.emitFgColor(writer, cell.fg);
+        // Turn OFF attributes that were on but are now off
+        // Bold and dim share a reset code (22), so handle them together
+        if ((old_attrs.bold and !new_attrs.bold) or (old_attrs.dim and !new_attrs.dim)) {
+            try writer.writeAll("\x1b[22m");
+            // If we reset bold/dim but still need one of them, re-apply
+            if (new_attrs.bold) try writer.writeAll("\x1b[1m");
+            if (new_attrs.dim) try writer.writeAll("\x1b[2m");
+        } else {
+            // Turn ON attributes that were off but are now on
+            if (!old_attrs.bold and new_attrs.bold) try writer.writeAll("\x1b[1m");
+            if (!old_attrs.dim and new_attrs.dim) try writer.writeAll("\x1b[2m");
+        }
 
-    // Apply background color
-    try self.emitBgColor(writer, cell.bg);
+        if (old_attrs.italic and !new_attrs.italic) try writer.writeAll("\x1b[23m");
+        if (!old_attrs.italic and new_attrs.italic) try writer.writeAll("\x1b[3m");
+
+        if (old_attrs.underline and !new_attrs.underline) try writer.writeAll("\x1b[24m");
+        if (!old_attrs.underline and new_attrs.underline) try writer.writeAll("\x1b[4m");
+
+        if (old_attrs.blink and !new_attrs.blink) try writer.writeAll("\x1b[25m");
+        if (!old_attrs.blink and new_attrs.blink) try writer.writeAll("\x1b[5m");
+
+        if (old_attrs.reverse and !new_attrs.reverse) try writer.writeAll("\x1b[27m");
+        if (!old_attrs.reverse and new_attrs.reverse) try writer.writeAll("\x1b[7m");
+
+        if (old_attrs.strikethrough and !new_attrs.strikethrough) try writer.writeAll("\x1b[29m");
+        if (!old_attrs.strikethrough and new_attrs.strikethrough) try writer.writeAll("\x1b[9m");
+    }
+
+    // Apply foreground color if changed
+    if (need_fg_change) {
+        try self.emitFgColor(writer, cell.fg);
+    }
+
+    // Apply background color if changed
+    if (need_bg_change) {
+        try self.emitBgColor(writer, cell.bg);
+    }
 
     last_fg.* = cell.fg;
     last_bg.* = cell.bg;
@@ -538,4 +572,178 @@ test "Renderer handles combining marks in diff" {
 
     // Second output should contain the combining mark
     try std.testing.expect(std.mem.indexOf(u8, output2.items, "e\xCC\x81") != null);
+}
+
+test "Renderer delta attributes: turn on single attribute" {
+    var renderer = try Renderer.init(std.testing.allocator, .{ .width = 10, .height = 5 }, .true_color);
+    defer renderer.deinit();
+
+    const buf = renderer.buffer();
+    // First cell with no attributes
+    buf.setCell(0, 0, Cell{ .char = 'A', .fg = .default, .bg = .default, .attrs = .{} });
+    // Second cell with bold - should emit \x1b[1m, not full reset
+    buf.setCell(1, 0, Cell{ .char = 'B', .fg = .default, .bg = .default, .attrs = .{ .bold = true } });
+
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(std.testing.allocator);
+    try renderer.flush(output.writer(std.testing.allocator));
+
+    // Should contain bold sequence
+    try std.testing.expect(std.mem.indexOf(u8, output.items, "\x1b[1m") != null);
+}
+
+test "Renderer delta attributes: turn off single attribute" {
+    var renderer = try Renderer.init(std.testing.allocator, .{ .width = 10, .height = 5 }, .true_color);
+    defer renderer.deinit();
+
+    const buf = renderer.buffer();
+    // First cell with bold
+    buf.setCell(0, 0, Cell{ .char = 'A', .fg = .default, .bg = .default, .attrs = .{ .bold = true } });
+    // Second cell without bold - should emit \x1b[22m (reset bold/dim)
+    buf.setCell(1, 0, Cell{ .char = 'B', .fg = .default, .bg = .default, .attrs = .{} });
+
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(std.testing.allocator);
+    try renderer.flush(output.writer(std.testing.allocator));
+
+    // Should contain bold-off sequence (22m)
+    try std.testing.expect(std.mem.indexOf(u8, output.items, "\x1b[22m") != null);
+}
+
+test "Renderer delta attributes: change only color keeps attributes" {
+    var renderer = try Renderer.init(std.testing.allocator, .{ .width = 10, .height = 5 }, .true_color);
+    defer renderer.deinit();
+
+    const buf = renderer.buffer();
+    // First cell: bold + red
+    buf.setCell(0, 0, Cell{ .char = 'A', .fg = Color.red, .bg = .default, .attrs = .{ .bold = true } });
+    // Second cell: bold + blue (only color changed)
+    buf.setCell(1, 0, Cell{ .char = 'B', .fg = Color.blue, .bg = .default, .attrs = .{ .bold = true } });
+
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(std.testing.allocator);
+    try renderer.flush(output.writer(std.testing.allocator));
+
+    // After first cell, output should have bold. Second cell should NOT reset (no \x1b[0m after bold is set)
+    // Count occurrences of bold-on sequence - should be only 1
+    var bold_count: usize = 0;
+    var i: usize = 0;
+    while (std.mem.indexOf(u8, output.items[i..], "\x1b[1m")) |idx| {
+        bold_count += 1;
+        i += idx + 4;
+    }
+    try std.testing.expectEqual(@as(usize, 1), bold_count);
+}
+
+test "Renderer delta attributes: switch between italic and underline" {
+    var renderer = try Renderer.init(std.testing.allocator, .{ .width = 10, .height = 5 }, .true_color);
+    defer renderer.deinit();
+
+    const buf = renderer.buffer();
+    // First cell: italic
+    buf.setCell(0, 0, Cell{ .char = 'A', .fg = .default, .bg = .default, .attrs = .{ .italic = true } });
+    // Second cell: underline (no italic)
+    buf.setCell(1, 0, Cell{ .char = 'B', .fg = .default, .bg = .default, .attrs = .{ .underline = true } });
+
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(std.testing.allocator);
+    try renderer.flush(output.writer(std.testing.allocator));
+
+    // Should contain italic-on, then italic-off (23m), then underline-on
+    try std.testing.expect(std.mem.indexOf(u8, output.items, "\x1b[3m") != null); // italic on
+    try std.testing.expect(std.mem.indexOf(u8, output.items, "\x1b[23m") != null); // italic off
+    try std.testing.expect(std.mem.indexOf(u8, output.items, "\x1b[4m") != null); // underline on
+}
+
+test "Renderer delta attributes: bold to dim transition" {
+    var renderer = try Renderer.init(std.testing.allocator, .{ .width = 10, .height = 5 }, .true_color);
+    defer renderer.deinit();
+
+    const buf = renderer.buffer();
+    // First cell: bold
+    buf.setCell(0, 0, Cell{ .char = 'A', .fg = .default, .bg = .default, .attrs = .{ .bold = true } });
+    // Second cell: dim (not bold) - should reset with 22m then apply 2m
+    buf.setCell(1, 0, Cell{ .char = 'B', .fg = .default, .bg = .default, .attrs = .{ .dim = true } });
+
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(std.testing.allocator);
+    try renderer.flush(output.writer(std.testing.allocator));
+
+    // Find positions to verify ordering
+    const bold_pos = std.mem.indexOf(u8, output.items, "\x1b[1m");
+    const reset_pos = std.mem.indexOf(u8, output.items, "\x1b[22m");
+    const dim_pos = std.mem.indexOf(u8, output.items, "\x1b[2m");
+
+    try std.testing.expect(bold_pos != null);
+    try std.testing.expect(reset_pos != null);
+    try std.testing.expect(dim_pos != null);
+    try std.testing.expect(bold_pos.? < reset_pos.?); // bold comes before reset
+    try std.testing.expect(reset_pos.? < dim_pos.?); // reset comes before dim
+}
+
+test "Renderer delta attributes: multiple attributes at once" {
+    var renderer = try Renderer.init(std.testing.allocator, .{ .width = 10, .height = 5 }, .true_color);
+    defer renderer.deinit();
+
+    const buf = renderer.buffer();
+    // Cell with bold, italic, underline
+    buf.setCell(0, 0, Cell{
+        .char = 'X',
+        .fg = .default,
+        .bg = .default,
+        .attrs = .{ .bold = true, .italic = true, .underline = true },
+    });
+
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(std.testing.allocator);
+    try renderer.flush(output.writer(std.testing.allocator));
+
+    // Should contain all three attribute sequences
+    try std.testing.expect(std.mem.indexOf(u8, output.items, "\x1b[1m") != null); // bold
+    try std.testing.expect(std.mem.indexOf(u8, output.items, "\x1b[3m") != null); // italic
+    try std.testing.expect(std.mem.indexOf(u8, output.items, "\x1b[4m") != null); // underline
+}
+
+test "Renderer emits baseline reset on first render" {
+    // Regression test: ensure first render emits \x1b[0m to clear any stale
+    // terminal attributes inherited from the shell prompt or prior state
+    var renderer = try Renderer.init(std.testing.allocator, .{ .width = 10, .height = 5 }, .true_color);
+    defer renderer.deinit();
+
+    const buf = renderer.buffer();
+    // Even a cell with default attributes should trigger baseline reset on first render
+    buf.setCell(0, 0, Cell{ .char = 'A', .fg = .default, .bg = .default, .attrs = .{} });
+
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(std.testing.allocator);
+    try renderer.flush(output.writer(std.testing.allocator));
+
+    // First render should contain a reset sequence to clear stale terminal state
+    try std.testing.expect(std.mem.indexOf(u8, output.items, "\x1b[0m") != null);
+}
+
+test "Renderer delta: avoids redundant attribute sequences within frame" {
+    // Within a single frame, the delta emitter should not emit redundant attribute
+    // sequences when rendering consecutive cells with the same attributes
+    var renderer = try Renderer.init(std.testing.allocator, .{ .width = 10, .height = 5 }, .true_color);
+    defer renderer.deinit();
+
+    const buf = renderer.buffer();
+    // Set two adjacent cells with the same bold attribute
+    buf.setCell(0, 0, Cell{ .char = 'A', .fg = .default, .bg = .default, .attrs = .{ .bold = true } });
+    buf.setCell(1, 0, Cell{ .char = 'B', .fg = .default, .bg = .default, .attrs = .{ .bold = true } });
+
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(std.testing.allocator);
+    try renderer.flush(output.writer(std.testing.allocator));
+
+    // Count bold-on sequences - should be exactly 1, not 2
+    // (first cell establishes bold, second cell doesn't need to re-emit)
+    var bold_count: usize = 0;
+    var i: usize = 0;
+    while (std.mem.indexOf(u8, output.items[i..], "\x1b[1m")) |idx| {
+        bold_count += 1;
+        i += idx + 4;
+    }
+    try std.testing.expectEqual(@as(usize, 1), bold_count);
 }
