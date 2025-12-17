@@ -109,18 +109,22 @@ pub fn init(allocator: std.mem.Allocator, options: Options) !Terminal {
     const root = try Plane.initRoot(allocator, term_size);
     errdefer root.deinit();
 
-    // Initialize compositor with renderer's back buffer as target
-    const compositor_inst = Compositor.init(allocator, renderer_inst.buffer());
-
-    return .{
+    // Build terminal and then wire compositor to the renderer's buffer.
+    var term = Terminal{
         .backend = bkend,
         .renderer = renderer_inst,
-        .compositor = compositor_inst,
+        .compositor = undefined,
         .root = root,
         .allocator = allocator,
         .auto_present = options.auto_present,
         .dirty = false,
     };
+
+    // Important: compositor needs a pointer to the renderer's back buffer
+    // after the renderer has reached its final location. Taking the pointer
+    // before constructing `term` would dangle after the move.
+    term.compositor = Compositor.init(allocator, term.renderer.buffer());
+    return term;
 }
 
 /// Clean up and restore terminal state.
@@ -225,6 +229,9 @@ pub fn invalidatePlaneMove(self: *Terminal, plane: *const Plane, old_x: i32, old
 /// This composes all visible planes and flushes the result to the terminal.
 /// Only changed regions are rendered (diff-based).
 pub fn present(self: *Terminal) !void {
+    // Ensure compositor targets the current renderer buffer (Terminal can be moved).
+    self.compositor.target = self.renderer.buffer();
+
     // Compose planes into renderer's back buffer
     const dirty_regions = try self.compositor.compose(self.root);
     defer self.allocator.free(dirty_regions);

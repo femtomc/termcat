@@ -201,8 +201,8 @@ pub fn main() !void {
         try term.present();
         frame +%= 1;
 
-        // Small delay to control frame rate (~60fps)
-        std.Thread.sleep(16 * std.time.ns_per_ms);
+        // Small delay to control frame rate (~120fps)
+        std.Thread.sleep(8 * std.time.ns_per_ms);
     }
 }
 
