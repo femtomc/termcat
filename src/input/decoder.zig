@@ -32,10 +32,12 @@ const State = enum {
 
 /// Maximum size for sequence buffer
 const max_seq_len = 64;
-/// Maximum size for paste buffer
-const max_paste_len = 64 * 1024;
 /// Maximum CSI parameter count
 const max_params = 16;
+/// Maximum size for paste buffer (16MB - generous but finite to prevent OOM)
+const max_paste_len = 16 * 1024 * 1024;
+/// Bracketed paste end sequence: ESC [ 2 0 1 ~
+const paste_end_seq = "\x1b[201~";
 
 /// Sequence buffer for partial input
 seq_buf: [max_seq_len]u8,
@@ -65,6 +67,10 @@ paste_len: usize,
 allocator: std.mem.Allocator,
 /// Whether paste buffer is allocated
 paste_allocated: bool,
+/// Buffer for potential end sequence during paste
+paste_end_buf: [paste_end_seq.len]u8,
+/// How many bytes of potential end sequence we've matched
+paste_end_len: u3,
 
 /// Initialize the decoder
 pub fn init(allocator: std.mem.Allocator) Decoder {
@@ -83,6 +89,8 @@ pub fn init(allocator: std.mem.Allocator) Decoder {
         .paste_len = 0,
         .allocator = allocator,
         .paste_allocated = false,
+        .paste_end_buf = undefined,
+        .paste_end_len = 0,
     };
 }
 
@@ -310,39 +318,55 @@ fn handleMouseSgr(self: *Decoder, byte: u8) Result {
 }
 
 /// Handle paste data (inside bracketed paste)
+/// Uses a proper state machine to detect the end sequence without false matches.
+/// The key insight: we buffer potential end sequence bytes separately and only
+/// commit them to the paste buffer if they don't form the complete end sequence.
 fn handlePaste(self: *Decoder, byte: u8) !Result {
-    // Check for end sequence: ESC [ 2 0 1 ~
-    // We need to buffer and look for this pattern
-    if (self.paste_len >= 5) {
-        const end_seq = "\x1b[201~";
-        const start = self.paste_len - 5;
-        if (std.mem.eql(u8, self.paste_buf[start..self.paste_len], end_seq[0..5]) and byte == '~') {
-            // Found end of paste - return the paste content (excluding end marker)
-            const paste_content = self.paste_buf[0..start];
+    // Check if byte continues the end sequence
+    if (byte == paste_end_seq[self.paste_end_len]) {
+        self.paste_end_buf[self.paste_end_len] = byte;
+        self.paste_end_len += 1;
+
+        // Check if we've matched the complete end sequence
+        if (self.paste_end_len == paste_end_seq.len) {
+            // Found end of paste - return the paste content
+            const paste_content = self.paste_buf[0..self.paste_len];
             self.state = .ground;
-            const result = Result{ .event = .{ .paste = paste_content } };
-            // Don't clear paste_len yet - data is still valid until next event
-            return result;
+            self.paste_end_len = 0;
+            return Result{ .event = .{ .paste = paste_content } };
         }
+        return .none;
     }
 
-    // Check for partial end sequence at very start
-    if (self.paste_len == 0 and byte == 0x1b) {
-        // Could be start of end sequence
+    // Byte doesn't continue the end sequence.
+    // Flush any buffered end sequence bytes to paste buffer, then add current byte.
+    if (self.paste_end_len > 0) {
+        // The buffered bytes were not actually an end sequence - add them to paste
+        for (self.paste_end_buf[0..self.paste_end_len]) |buffered_byte| {
+            try self.appendPasteByte(buffered_byte);
+        }
+        self.paste_end_len = 0;
     }
 
-    // Append byte to paste buffer
-    if (self.paste_len < self.paste_buf.len) {
-        self.paste_buf[self.paste_len] = byte;
-        self.paste_len += 1;
-    } else {
-        // Buffer full - need to grow
-        try self.growPasteBuffer();
-        self.paste_buf[self.paste_len] = byte;
-        self.paste_len += 1;
+    // Check if the current byte starts a new potential end sequence
+    if (byte == paste_end_seq[0]) {
+        self.paste_end_buf[0] = byte;
+        self.paste_end_len = 1;
+        return .none;
     }
 
+    // Regular paste content byte
+    try self.appendPasteByte(byte);
     return .none;
+}
+
+/// Append a byte to the paste buffer, growing if needed
+fn appendPasteByte(self: *Decoder, byte: u8) !void {
+    if (self.paste_len >= self.paste_buf.len) {
+        try self.growPasteBuffer();
+    }
+    self.paste_buf[self.paste_len] = byte;
+    self.paste_len += 1;
 }
 
 /// Handle UTF-8 continuation bytes
@@ -593,6 +617,7 @@ fn pushParam(self: *Decoder) void {
 fn startPaste(self: *Decoder) void {
     self.state = .paste;
     self.paste_len = 0;
+    self.paste_end_len = 0;
     // Allocate initial paste buffer if not already done
     if (!self.paste_allocated) {
         self.paste_buf = self.allocator.alloc(u8, 4096) catch &.{};
@@ -604,12 +629,17 @@ fn startPaste(self: *Decoder) void {
 
 /// Grow paste buffer
 fn growPasteBuffer(self: *Decoder) !void {
-    const new_len = @min(self.paste_buf.len * 2, max_paste_len);
-    if (new_len <= self.paste_buf.len) {
+    // Double the buffer size, capped at max_paste_len to prevent OOM from malformed input.
+    // For a 4KB initial buffer, growth: 4K -> 8K -> 16K -> ... -> 16MB (max).
+    const current_len = if (self.paste_buf.len == 0) 0 else self.paste_buf.len;
+    const new_len = @min(if (current_len == 0) 4096 else current_len * 2, max_paste_len);
+    if (new_len <= current_len) {
         return error.PasteBufferFull;
     }
     const new_buf = try self.allocator.realloc(self.paste_buf, new_len);
     self.paste_buf = new_buf;
+    // Mark as allocated (handles case where startPaste's initial alloc failed)
+    self.paste_allocated = true;
 }
 
 /// Reset decoder state (for timeout handling)
@@ -797,4 +827,181 @@ test "decode alt+utf8 character" {
     try std.testing.expect(result == .event);
     try std.testing.expectEqual(@as(?u21, 0xe9), result.event.key.codepoint);
     try std.testing.expect(result.event.key.mods.alt);
+}
+
+test "decode simple bracketed paste" {
+    var decoder = Decoder.init(std.testing.allocator);
+    defer decoder.deinit();
+
+    // Bracketed paste: ESC [ 200 ~ <content> ESC [ 201 ~
+    const paste_start = "\x1b[200~";
+    const paste_content = "Hello, pasted text!";
+    const paste_end = "\x1b[201~";
+
+    // Feed start sequence
+    for (paste_start) |byte| {
+        const result = try decoder.feed(byte);
+        try std.testing.expect(result == .none);
+    }
+
+    // Feed content
+    for (paste_content) |byte| {
+        const result = try decoder.feed(byte);
+        try std.testing.expect(result == .none);
+    }
+
+    // Feed end sequence - last byte should return the event
+    var paste_event: ?[]const u8 = null;
+    for (paste_end) |byte| {
+        const result = try decoder.feed(byte);
+        if (result == .event and result.event == .paste) {
+            paste_event = result.event.paste;
+        }
+    }
+
+    try std.testing.expect(paste_event != null);
+    try std.testing.expectEqualStrings(paste_content, paste_event.?);
+}
+
+test "bracketed paste with embedded end sequence pattern" {
+    var decoder = Decoder.init(std.testing.allocator);
+    defer decoder.deinit();
+
+    // This tests the edge case where pasted content contains the EXACT end sequence bytes.
+    // LIMITATION: At the byte level, we cannot distinguish between:
+    // 1. Content that literally contains "\x1b[201~"
+    // 2. The real terminal-sent end marker "\x1b[201~"
+    //
+    // Modern terminals typically filter ESC (0x1b) from pasted content, replacing it
+    // with a space or stripping it entirely. So in practice, if a user pastes text
+    // containing "\x1b[201~", the terminal sends " [201~" (space, not ESC).
+    //
+    // For the rare case where the exact bytes are somehow present, the paste will
+    // terminate at that point, and the remaining content becomes separate events.
+    const paste_start = "\x1b[200~";
+    const content_before_fake_end = "text with ";
+    const fake_end_seq = "\x1b[201~";
+    _ = " embedded end sequence and more"; // Content after fake end (becomes key events)
+
+    // Feed start sequence
+    for (paste_start) |byte| {
+        _ = try decoder.feed(byte);
+    }
+
+    // Feed content before the embedded end sequence
+    for (content_before_fake_end) |byte| {
+        _ = try decoder.feed(byte);
+    }
+
+    // Feed the embedded end sequence - this will trigger a paste event
+    var first_paste: ?[]const u8 = null;
+    for (fake_end_seq) |byte| {
+        const result = try decoder.feed(byte);
+        if (result == .event and result.event == .paste) {
+            first_paste = result.event.paste;
+        }
+    }
+
+    // The first paste event should contain content before the fake end sequence
+    try std.testing.expect(first_paste != null);
+    try std.testing.expectEqualStrings(content_before_fake_end, first_paste.?);
+
+    // The remaining content becomes regular key events (since we're back in ground state)
+    // This is the documented limitation - the paste is split.
+}
+
+test "bracketed paste with partial end sequence in content" {
+    var decoder = Decoder.init(std.testing.allocator);
+    defer decoder.deinit();
+
+    // Test content that contains partial end sequence: ESC [ 2 0 1 (without final ~)
+    const paste_start = "\x1b[200~";
+    const paste_content = "partial \x1b[201 sequence"; // Missing final ~
+    const paste_end = "\x1b[201~";
+
+    for (paste_start) |byte| {
+        _ = try decoder.feed(byte);
+    }
+
+    for (paste_content) |byte| {
+        _ = try decoder.feed(byte);
+    }
+
+    var paste_event: ?[]const u8 = null;
+    for (paste_end) |byte| {
+        const result = try decoder.feed(byte);
+        if (result == .event and result.event == .paste) {
+            paste_event = result.event.paste;
+        }
+    }
+
+    try std.testing.expect(paste_event != null);
+    try std.testing.expectEqualStrings(paste_content, paste_event.?);
+}
+
+test "bracketed paste with ESC bytes in content" {
+    var decoder = Decoder.init(std.testing.allocator);
+    defer decoder.deinit();
+
+    // Test content with ESC bytes that don't form the end sequence
+    const paste_start = "\x1b[200~";
+    const paste_content = "has \x1b escape and \x1b[ csi start";
+    const paste_end = "\x1b[201~";
+
+    for (paste_start) |byte| {
+        _ = try decoder.feed(byte);
+    }
+
+    for (paste_content) |byte| {
+        _ = try decoder.feed(byte);
+    }
+
+    var paste_event: ?[]const u8 = null;
+    for (paste_end) |byte| {
+        const result = try decoder.feed(byte);
+        if (result == .event and result.event == .paste) {
+            paste_event = result.event.paste;
+        }
+    }
+
+    try std.testing.expect(paste_event != null);
+    try std.testing.expectEqualStrings(paste_content, paste_event.?);
+}
+
+test "bracketed paste large content" {
+    var decoder = Decoder.init(std.testing.allocator);
+    defer decoder.deinit();
+
+    // Test paste larger than initial buffer (4KB)
+    const paste_start = "\x1b[200~";
+    const paste_end = "\x1b[201~";
+    const content_size = 100 * 1024; // 100KB - larger than old 64KB limit
+
+    for (paste_start) |byte| {
+        _ = try decoder.feed(byte);
+    }
+
+    // Feed large content
+    var i: usize = 0;
+    while (i < content_size) : (i += 1) {
+        const byte: u8 = @intCast('A' + (i % 26));
+        _ = try decoder.feed(byte);
+    }
+
+    var paste_event: ?[]const u8 = null;
+    for (paste_end) |byte| {
+        const result = try decoder.feed(byte);
+        if (result == .event and result.event == .paste) {
+            paste_event = result.event.paste;
+        }
+    }
+
+    try std.testing.expect(paste_event != null);
+    try std.testing.expectEqual(content_size, paste_event.?.len);
+
+    // Verify content is correct
+    for (paste_event.?, 0..) |byte, j| {
+        const expected: u8 = @intCast('A' + (j % 26));
+        try std.testing.expectEqual(expected, byte);
+    }
 }
