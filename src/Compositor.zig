@@ -103,7 +103,13 @@ pub fn invalidatePlaneMove(self: *Compositor, plane: *const Plane, old_x: i32, o
 /// Compose all visible planes from the root into the target buffer.
 /// Returns the list of dirty regions that were composited (for diff renderer).
 /// Caller owns the returned slice and must free it with the compositor's allocator.
-pub fn compose(self: *Compositor, root: *const Plane) ![]const Rect {
+///
+/// Auto dirty-tracking: This function automatically collects dirty regions from
+/// all visible planes. Plane drawing operations (setCell, print, fill, clear)
+/// automatically mark planes dirty, so explicit invalidatePlane() calls are
+/// typically not needed for content changes. However, structural changes (move,
+/// visibility changes) still require explicit invalidation.
+pub fn compose(self: *Compositor, root: *Plane) ![]const Rect {
     // Collect all dirty regions for this frame
     var frame_dirty: std.ArrayList(Rect) = .empty;
     defer frame_dirty.deinit(self.allocator);
@@ -117,8 +123,14 @@ pub fn compose(self: *Compositor, root: *const Plane) ![]const Rect {
             .height = self.target.height,
         });
         self.needs_full_redraw = false;
+
+        // Clear plane dirty flags since we're doing a full redraw
+        try self.clearPlaneDirtyFlags(root);
     } else {
-        // Coalesce dirty regions
+        // Collect dirty regions from planes (auto dirty-tracking)
+        try self.collectPlaneDirtyRegions(root);
+
+        // Coalesce all dirty regions (manual + auto-collected)
         const coalesced = try coalesceRegions(self.allocator, self.dirty_regions.items);
         defer self.allocator.free(coalesced);
         for (coalesced) |region| {
@@ -147,6 +159,49 @@ pub fn compose(self: *Compositor, root: *const Plane) ![]const Rect {
     const result = try self.allocator.alloc(Rect, frame_dirty.items.len);
     @memcpy(result, frame_dirty.items);
     return result;
+}
+
+/// Collect dirty regions from all visible planes and add them to dirty_regions.
+/// Also clears the dirty flags on planes after collecting.
+fn collectPlaneDirtyRegions(self: *Compositor, root: *Plane) !void {
+    try self.collectPlaneDirtyRegionsInner(root);
+}
+
+fn collectPlaneDirtyRegionsInner(self: *Compositor, plane: *Plane) !void {
+    if (!plane.visible) {
+        // Hidden planes don't contribute dirty regions, but we still clear their flags
+        _ = plane.takeDirtyRect();
+        // Still recurse into children to clear their flags too
+        for (plane.children.items) |child| {
+            try self.collectPlaneDirtyRegionsInner(child);
+        }
+        return;
+    }
+
+    // Collect dirty region from this plane (converts to screen coords, clips)
+    // Note: getDirtyScreenRect reads dirty_rect, so call before takeDirtyRect
+    if (plane.getDirtyScreenRect()) |screen_dirty| {
+        const clipped = clipToBuffer(screen_dirty, self.target);
+        if (clipped) |rect| {
+            try self.dirty_regions.append(self.allocator, rect);
+        }
+    }
+
+    // Clear the plane's dirty flag
+    _ = plane.takeDirtyRect();
+
+    // Recurse into children
+    for (plane.children.items) |child| {
+        try self.collectPlaneDirtyRegionsInner(child);
+    }
+}
+
+/// Clear dirty flags on all planes without collecting regions (for full redraw).
+fn clearPlaneDirtyFlags(self: *Compositor, plane: *Plane) !void {
+    _ = plane.takeDirtyRect();
+    for (plane.children.items) |child| {
+        try self.clearPlaneDirtyFlags(child);
+    }
 }
 
 /// Composite a single dirty region.
@@ -804,4 +859,166 @@ test "isTransparent" {
         .attrs = .{},
     };
     try std.testing.expect(!isTransparent(continuation_cell));
+}
+
+// ============================================================================
+// Auto dirty-tracking tests
+// ============================================================================
+
+test "Compositor auto collects dirty regions from planes" {
+    const allocator = std.testing.allocator;
+
+    var buf = try Buffer.init(allocator, .{ .width = 40, .height = 20 });
+    defer buf.deinit();
+
+    var compositor = Compositor.init(allocator, &buf);
+    defer compositor.deinit();
+
+    const root = try Plane.initRoot(allocator, .{ .width = 40, .height = 20 });
+    defer root.deinit();
+
+    // First compose - full redraw
+    const dirty1 = try compositor.compose(root);
+    defer allocator.free(dirty1);
+
+    // Plane dirty should be cleared after compose
+    try std.testing.expect(!root.isDirty());
+
+    // Now draw something (no explicit invalidatePlane needed!)
+    root.print(5, 3, "Hello", Cell.Color.white, Cell.Color.black, .{});
+
+    // Compose should automatically pick up the dirty region
+    const dirty2 = try compositor.compose(root);
+    defer allocator.free(dirty2);
+
+    // Should have dirty region
+    try std.testing.expect(dirty2.len > 0);
+
+    // Check that content is in buffer
+    try std.testing.expectEqual(@as(u21, 'H'), buf.getCell(5, 3).char);
+    try std.testing.expectEqual(@as(u21, 'e'), buf.getCell(6, 3).char);
+}
+
+test "Compositor auto collects dirty from child planes" {
+    const allocator = std.testing.allocator;
+
+    var buf = try Buffer.init(allocator, .{ .width = 40, .height = 20 });
+    defer buf.deinit();
+
+    var compositor = Compositor.init(allocator, &buf);
+    defer compositor.deinit();
+
+    const root = try Plane.initRoot(allocator, .{ .width = 40, .height = 20 });
+    defer root.deinit();
+
+    // First compose
+    const dirty1 = try compositor.compose(root);
+    defer allocator.free(dirty1);
+
+    // Create child and draw on it
+    const child = try Plane.initChild(root, 10, 5, .{ .width = 15, .height = 8 });
+    child.print(0, 0, "Child", Cell.Color.green, Cell.Color.black, .{});
+
+    // Compose should auto-collect child's dirty region
+    const dirty2 = try compositor.compose(root);
+    defer allocator.free(dirty2);
+
+    try std.testing.expect(dirty2.len > 0);
+
+    // Child content should be in buffer at screen position (10, 5)
+    try std.testing.expectEqual(@as(u21, 'C'), buf.getCell(10, 5).char);
+    try std.testing.expectEqual(@as(u21, 'h'), buf.getCell(11, 5).char);
+}
+
+test "Compositor clears plane dirty flags after compose" {
+    const allocator = std.testing.allocator;
+
+    var buf = try Buffer.init(allocator, .{ .width = 40, .height = 20 });
+    defer buf.deinit();
+
+    var compositor = Compositor.init(allocator, &buf);
+    defer compositor.deinit();
+
+    const root = try Plane.initRoot(allocator, .{ .width = 40, .height = 20 });
+    defer root.deinit();
+
+    const child = try Plane.initChild(root, 5, 5, .{ .width = 10, .height = 5 });
+
+    // First compose
+    const dirty1 = try compositor.compose(root);
+    defer allocator.free(dirty1);
+
+    // Draw on both planes
+    root.setCell(0, 0, Cell{ .char = 'R', .combining = .{ 0, 0 }, .fg = .default, .bg = .default, .attrs = .{} });
+    child.setCell(0, 0, Cell{ .char = 'C', .combining = .{ 0, 0 }, .fg = .default, .bg = .default, .attrs = .{} });
+
+    try std.testing.expect(root.isDirty());
+    try std.testing.expect(child.isDirty());
+
+    // Compose
+    const dirty2 = try compositor.compose(root);
+    defer allocator.free(dirty2);
+
+    // Both should be clean now
+    try std.testing.expect(!root.isDirty());
+    try std.testing.expect(!child.isDirty());
+}
+
+test "Compositor full redraw clears plane dirty flags" {
+    const allocator = std.testing.allocator;
+
+    var buf = try Buffer.init(allocator, .{ .width = 40, .height = 20 });
+    defer buf.deinit();
+
+    var compositor = Compositor.init(allocator, &buf);
+    defer compositor.deinit();
+
+    const root = try Plane.initRoot(allocator, .{ .width = 40, .height = 20 });
+    defer root.deinit();
+
+    // Draw something to make plane dirty
+    root.print(0, 0, "Test", Cell.Color.white, Cell.Color.black, .{});
+    try std.testing.expect(root.isDirty());
+
+    // Force full redraw
+    compositor.invalidateAll();
+
+    // Compose
+    const dirty = try compositor.compose(root);
+    defer allocator.free(dirty);
+
+    // Full redraw should have cleared the plane's dirty flag
+    try std.testing.expect(!root.isDirty());
+}
+
+test "Compositor hidden plane dirty ignored" {
+    const allocator = std.testing.allocator;
+
+    var buf = try Buffer.init(allocator, .{ .width = 40, .height = 20 });
+    defer buf.deinit();
+
+    var compositor = Compositor.init(allocator, &buf);
+    defer compositor.deinit();
+
+    const root = try Plane.initRoot(allocator, .{ .width = 40, .height = 20 });
+    defer root.deinit();
+
+    // First compose
+    const dirty1 = try compositor.compose(root);
+    defer allocator.free(dirty1);
+
+    // Create hidden child and draw on it
+    const child = try Plane.initChild(root, 10, 5, .{ .width = 15, .height = 8 });
+    child.setVisible(false);
+    child.print(0, 0, "Hidden", Cell.Color.red, Cell.Color.black, .{});
+
+    // Compose - hidden plane's dirty region should not be collected
+    const dirty2 = try compositor.compose(root);
+    defer allocator.free(dirty2);
+
+    // No dirty regions since hidden plane doesn't contribute
+    try std.testing.expectEqual(@as(usize, 0), dirty2.len);
+
+    // Child's dirty flag should still be cleared
+    try std.testing.expect(!child.isDirty());
 }

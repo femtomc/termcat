@@ -44,6 +44,10 @@ visible: bool,
 /// Allocator for managing children and buffer
 allocator: std.mem.Allocator,
 
+/// Dirty region tracking: bounding box of modifications since last clear.
+/// Coordinates are in plane-local space. null means no modifications.
+dirty_rect: ?Rect,
+
 /// Create a new root plane (no parent).
 /// Root planes typically represent the full screen.
 pub fn initRoot(allocator: std.mem.Allocator, dimensions: Size) !*Plane {
@@ -62,6 +66,7 @@ pub fn initRoot(allocator: std.mem.Allocator, dimensions: Size) !*Plane {
         .children = .empty,
         .visible = true,
         .allocator = allocator,
+        .dirty_rect = null,
     };
 
     return plane;
@@ -92,6 +97,7 @@ pub fn initChild(
         .children = .empty,
         .visible = true,
         .allocator = allocator,
+        .dirty_rect = null,
     };
 
     try parent.children.append(allocator, plane);
@@ -425,14 +431,20 @@ pub fn containsLocal(self: *const Plane, local_x: i32, local_y: i32) bool {
 }
 
 /// Get the cell buffer for direct drawing.
+/// Note: Modifications through this buffer bypass dirty tracking.
+/// Consider using setCell/print/fill/clear instead for automatic tracking.
 pub fn getBuffer(self: *Plane) *Buffer {
     return &self.buffer;
 }
 
 /// Set a cell at plane-local coordinates.
 /// Out-of-bounds coordinates are silently ignored.
+/// Automatically marks the cell as dirty.
 pub fn setCell(self: *Plane, x: u16, y: u16, cell: Cell) void {
-    self.buffer.setCell(x, y, cell);
+    if (x < self.width and y < self.height) {
+        self.buffer.setCell(x, y, cell);
+        self.markDirtyRect(.{ .x = x, .y = y, .width = 1, .height = 1 });
+    }
 }
 
 /// Get a cell at plane-local coordinates.
@@ -442,18 +454,127 @@ pub fn getCell(self: *const Plane, x: u16, y: u16) Cell {
 }
 
 /// Print text at plane-local coordinates.
+/// Automatically marks the printed region as dirty.
 pub fn print(self: *Plane, x: u16, y: u16, str: []const u8, fg: Color, bg: Color, attrs: Attributes) void {
+    const unicode = @import("unicode/width.zig");
     self.buffer.print(x, y, str, fg, bg, attrs);
+    // Calculate the width of the printed text
+    const text_width = unicode.stringWidth(str);
+    // Clip to plane bounds
+    const actual_width: u16 = @intCast(@min(text_width, self.width -| x));
+    if (actual_width > 0 and y < self.height) {
+        self.markDirtyRect(.{ .x = x, .y = y, .width = actual_width, .height = 1 });
+    }
 }
 
 /// Clear the plane's buffer.
+/// Automatically marks the entire plane as dirty.
 pub fn clear(self: *Plane) void {
     self.buffer.clear();
+    self.markDirtyRect(.{ .x = 0, .y = 0, .width = self.width, .height = self.height });
 }
 
 /// Fill a rectangle within the plane.
+/// Automatically marks the filled region as dirty.
 pub fn fill(self: *Plane, rect: Rect, cell: Cell) void {
     self.buffer.fill(rect, cell);
+    // Clip to plane bounds
+    const x_end = @min(rect.x +| rect.width, self.width);
+    const y_end = @min(rect.y +| rect.height, self.height);
+    const actual_width = x_end -| rect.x;
+    const actual_height = y_end -| rect.y;
+    if (actual_width > 0 and actual_height > 0) {
+        self.markDirtyRect(.{ .x = rect.x, .y = rect.y, .width = actual_width, .height = actual_height });
+    }
+}
+
+// ============================================================================
+// Dirty tracking
+// ============================================================================
+
+/// Mark a region as dirty (modified) in plane-local coordinates.
+/// Expands the existing dirty region to include the new area.
+pub fn markDirtyRect(self: *Plane, rect: Rect) void {
+    if (self.dirty_rect) |*existing| {
+        // Expand bounding box to include new region
+        const existing_right = existing.x +| existing.width;
+        const existing_bottom = existing.y +| existing.height;
+        const new_right = rect.x +| rect.width;
+        const new_bottom = rect.y +| rect.height;
+
+        const left = @min(existing.x, rect.x);
+        const top = @min(existing.y, rect.y);
+        const right = @max(existing_right, new_right);
+        const bottom = @max(existing_bottom, new_bottom);
+
+        existing.* = .{
+            .x = left,
+            .y = top,
+            .width = right - left,
+            .height = bottom - top,
+        };
+    } else {
+        self.dirty_rect = rect;
+    }
+}
+
+/// Mark the entire plane as dirty.
+pub fn markAllDirty(self: *Plane) void {
+    self.dirty_rect = .{ .x = 0, .y = 0, .width = self.width, .height = self.height };
+}
+
+/// Check if this plane has any dirty regions.
+pub fn isDirty(self: *const Plane) bool {
+    return self.dirty_rect != null;
+}
+
+/// Get and clear the dirty region.
+/// Returns the dirty rect in plane-local coordinates, or null if clean.
+/// After calling, the plane is marked as clean.
+pub fn takeDirtyRect(self: *Plane) ?Rect {
+    const rect = self.dirty_rect;
+    self.dirty_rect = null;
+    return rect;
+}
+
+/// Get the dirty region in screen coordinates, clipped to visible bounds.
+/// Returns null if plane is clean, hidden, or completely clipped.
+/// Does NOT clear the dirty flag (use takeDirtyRect for that).
+pub fn getDirtyScreenRect(self: *const Plane) ?Rect {
+    const local_dirty = self.dirty_rect orelse return null;
+
+    // Get the plane's visible screen bounds
+    const screen_bounds = self.getClippedBounds() orelse return null;
+
+    // Convert dirty rect to screen coordinates
+    const screen_pos = self.localToScreenSigned(@intCast(local_dirty.x), @intCast(local_dirty.y));
+
+    // Handle negative screen coordinates
+    var dirty_left: i32 = screen_pos.x;
+    var dirty_top: i32 = screen_pos.y;
+    var dirty_right: i32 = screen_pos.x + @as(i32, local_dirty.width);
+    var dirty_bottom: i32 = screen_pos.y + @as(i32, local_dirty.height);
+
+    // Clip to visible screen bounds
+    dirty_left = @max(dirty_left, @as(i32, screen_bounds.x));
+    dirty_top = @max(dirty_top, @as(i32, screen_bounds.y));
+    dirty_right = @min(dirty_right, @as(i32, screen_bounds.x) + @as(i32, screen_bounds.width));
+    dirty_bottom = @min(dirty_bottom, @as(i32, screen_bounds.y) + @as(i32, screen_bounds.height));
+
+    // Also clip to non-negative (screen space)
+    dirty_left = @max(dirty_left, 0);
+    dirty_top = @max(dirty_top, 0);
+
+    if (dirty_left >= dirty_right or dirty_top >= dirty_bottom) {
+        return null;
+    }
+
+    return .{
+        .x = @intCast(dirty_left),
+        .y = @intCast(dirty_top),
+        .width = @intCast(dirty_right - dirty_left),
+        .height = @intCast(dirty_bottom - dirty_top),
+    };
 }
 
 /// Get the dimensions of this plane.
@@ -1018,4 +1139,207 @@ test "localToScreenSigned preserves negative coordinates" {
     const unsigned = child.localToScreen(0, 0);
     try std.testing.expectEqual(@as(u16, 0), unsigned.x);
     try std.testing.expectEqual(@as(u16, 0), unsigned.y);
+}
+
+// ============================================================================
+// Dirty tracking tests
+// ============================================================================
+
+test "setCell marks plane dirty" {
+    const allocator = std.testing.allocator;
+
+    const root = try Plane.initRoot(allocator, .{ .width = 80, .height = 24 });
+    defer root.deinit();
+
+    // Initially not dirty
+    try std.testing.expect(!root.isDirty());
+
+    // Set a cell
+    root.setCell(5, 3, Cell{ .char = 'X', .combining = .{ 0, 0 }, .fg = .default, .bg = .default, .attrs = .{} });
+
+    // Now dirty
+    try std.testing.expect(root.isDirty());
+
+    // Dirty rect should be exactly the cell
+    const dirty = root.dirty_rect.?;
+    try std.testing.expectEqual(@as(u16, 5), dirty.x);
+    try std.testing.expectEqual(@as(u16, 3), dirty.y);
+    try std.testing.expectEqual(@as(u16, 1), dirty.width);
+    try std.testing.expectEqual(@as(u16, 1), dirty.height);
+}
+
+test "print marks region dirty" {
+    const allocator = std.testing.allocator;
+
+    const root = try Plane.initRoot(allocator, .{ .width = 80, .height = 24 });
+    defer root.deinit();
+
+    root.print(10, 5, "Hello", Color.white, Color.black, .{});
+
+    try std.testing.expect(root.isDirty());
+
+    const dirty = root.dirty_rect.?;
+    try std.testing.expectEqual(@as(u16, 10), dirty.x);
+    try std.testing.expectEqual(@as(u16, 5), dirty.y);
+    try std.testing.expectEqual(@as(u16, 5), dirty.width); // "Hello" is 5 chars
+    try std.testing.expectEqual(@as(u16, 1), dirty.height);
+}
+
+test "fill marks region dirty" {
+    const allocator = std.testing.allocator;
+
+    const root = try Plane.initRoot(allocator, .{ .width = 80, .height = 24 });
+    defer root.deinit();
+
+    const fill_cell = Cell{ .char = '#', .combining = .{ 0, 0 }, .fg = .default, .bg = .default, .attrs = .{} };
+    root.fill(.{ .x = 5, .y = 3, .width = 10, .height = 4 }, fill_cell);
+
+    try std.testing.expect(root.isDirty());
+
+    const dirty = root.dirty_rect.?;
+    try std.testing.expectEqual(@as(u16, 5), dirty.x);
+    try std.testing.expectEqual(@as(u16, 3), dirty.y);
+    try std.testing.expectEqual(@as(u16, 10), dirty.width);
+    try std.testing.expectEqual(@as(u16, 4), dirty.height);
+}
+
+test "clear marks entire plane dirty" {
+    const allocator = std.testing.allocator;
+
+    const root = try Plane.initRoot(allocator, .{ .width = 40, .height = 20 });
+    defer root.deinit();
+
+    root.clear();
+
+    try std.testing.expect(root.isDirty());
+
+    const dirty = root.dirty_rect.?;
+    try std.testing.expectEqual(@as(u16, 0), dirty.x);
+    try std.testing.expectEqual(@as(u16, 0), dirty.y);
+    try std.testing.expectEqual(@as(u16, 40), dirty.width);
+    try std.testing.expectEqual(@as(u16, 20), dirty.height);
+}
+
+test "multiple operations expand dirty region" {
+    const allocator = std.testing.allocator;
+
+    const root = try Plane.initRoot(allocator, .{ .width = 80, .height = 24 });
+    defer root.deinit();
+
+    // Set two cells at opposite corners
+    root.setCell(5, 3, Cell{ .char = 'A', .combining = .{ 0, 0 }, .fg = .default, .bg = .default, .attrs = .{} });
+    root.setCell(20, 10, Cell{ .char = 'B', .combining = .{ 0, 0 }, .fg = .default, .bg = .default, .attrs = .{} });
+
+    // Dirty region should be the bounding box
+    const dirty = root.dirty_rect.?;
+    try std.testing.expectEqual(@as(u16, 5), dirty.x);
+    try std.testing.expectEqual(@as(u16, 3), dirty.y);
+    try std.testing.expectEqual(@as(u16, 16), dirty.width); // 20 - 5 + 1 = 16
+    try std.testing.expectEqual(@as(u16, 8), dirty.height); // 10 - 3 + 1 = 8
+}
+
+test "takeDirtyRect clears dirty flag" {
+    const allocator = std.testing.allocator;
+
+    const root = try Plane.initRoot(allocator, .{ .width = 80, .height = 24 });
+    defer root.deinit();
+
+    root.setCell(5, 3, Cell{ .char = 'X', .combining = .{ 0, 0 }, .fg = .default, .bg = .default, .attrs = .{} });
+    try std.testing.expect(root.isDirty());
+
+    // Take the dirty rect
+    const dirty = root.takeDirtyRect();
+    try std.testing.expect(dirty != null);
+    try std.testing.expectEqual(@as(u16, 5), dirty.?.x);
+
+    // Now clean
+    try std.testing.expect(!root.isDirty());
+    try std.testing.expect(root.takeDirtyRect() == null);
+}
+
+test "getDirtyScreenRect converts to screen coordinates" {
+    const allocator = std.testing.allocator;
+
+    const root = try Plane.initRoot(allocator, .{ .width = 80, .height = 24 });
+    defer root.deinit();
+
+    const child = try Plane.initChild(root, 10, 5, .{ .width = 30, .height = 15 });
+
+    // Draw at local (3, 2)
+    child.setCell(3, 2, Cell{ .char = 'X', .combining = .{ 0, 0 }, .fg = .default, .bg = .default, .attrs = .{} });
+
+    // Screen position should be (13, 7) = (10+3, 5+2)
+    const screen_dirty = child.getDirtyScreenRect();
+    try std.testing.expect(screen_dirty != null);
+    try std.testing.expectEqual(@as(u16, 13), screen_dirty.?.x);
+    try std.testing.expectEqual(@as(u16, 7), screen_dirty.?.y);
+    try std.testing.expectEqual(@as(u16, 1), screen_dirty.?.width);
+    try std.testing.expectEqual(@as(u16, 1), screen_dirty.?.height);
+}
+
+test "getDirtyScreenRect clips to visible bounds" {
+    const allocator = std.testing.allocator;
+
+    const root = try Plane.initRoot(allocator, .{ .width = 20, .height = 10 });
+    defer root.deinit();
+
+    // Child extends beyond root bounds
+    const child = try Plane.initChild(root, 15, 5, .{ .width = 20, .height = 10 });
+
+    // Fill entire child (will extend beyond root)
+    child.clear();
+
+    // Screen dirty should be clipped to visible area
+    const screen_dirty = child.getDirtyScreenRect();
+    try std.testing.expect(screen_dirty != null);
+    try std.testing.expectEqual(@as(u16, 15), screen_dirty.?.x);
+    try std.testing.expectEqual(@as(u16, 5), screen_dirty.?.y);
+    try std.testing.expectEqual(@as(u16, 5), screen_dirty.?.width); // 20 - 15 = 5
+    try std.testing.expectEqual(@as(u16, 5), screen_dirty.?.height); // 10 - 5 = 5
+}
+
+test "getDirtyScreenRect returns null for hidden plane" {
+    const allocator = std.testing.allocator;
+
+    const root = try Plane.initRoot(allocator, .{ .width = 80, .height = 24 });
+    defer root.deinit();
+
+    const child = try Plane.initChild(root, 10, 5, .{ .width = 30, .height = 15 });
+    child.setCell(3, 2, Cell{ .char = 'X', .combining = .{ 0, 0 }, .fg = .default, .bg = .default, .attrs = .{} });
+
+    // Should return valid rect while visible
+    try std.testing.expect(child.getDirtyScreenRect() != null);
+
+    // Hide and check again
+    child.setVisible(false);
+    try std.testing.expect(child.getDirtyScreenRect() == null);
+}
+
+test "out of bounds setCell does not mark dirty" {
+    const allocator = std.testing.allocator;
+
+    const root = try Plane.initRoot(allocator, .{ .width = 10, .height = 5 });
+    defer root.deinit();
+
+    // Try to set cell outside bounds
+    root.setCell(100, 100, Cell{ .char = 'X', .combining = .{ 0, 0 }, .fg = .default, .bg = .default, .attrs = .{} });
+
+    // Should not be dirty
+    try std.testing.expect(!root.isDirty());
+}
+
+test "markAllDirty marks entire plane" {
+    const allocator = std.testing.allocator;
+
+    const root = try Plane.initRoot(allocator, .{ .width = 50, .height = 30 });
+    defer root.deinit();
+
+    root.markAllDirty();
+
+    try std.testing.expect(root.isDirty());
+    const dirty = root.dirty_rect.?;
+    try std.testing.expectEqual(@as(u16, 0), dirty.x);
+    try std.testing.expectEqual(@as(u16, 0), dirty.y);
+    try std.testing.expectEqual(@as(u16, 50), dirty.width);
+    try std.testing.expectEqual(@as(u16, 30), dirty.height);
 }
