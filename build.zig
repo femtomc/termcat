@@ -146,6 +146,7 @@ pub fn build(b: *std.Build) void {
     const examples = [_]struct { name: []const u8, path: []const u8 }{
         .{ .name = "input_logger", .path = "examples/input_logger.zig" },
         .{ .name = "color_grid", .path = "examples/color_grid.zig" },
+        .{ .name = "demo", .path = "examples/demo.zig" },
     };
 
     for (examples) |example| {

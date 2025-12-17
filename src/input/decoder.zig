@@ -34,6 +34,8 @@ const State = enum {
 const max_seq_len = 64;
 /// Maximum CSI parameter count
 const max_params = 16;
+/// Maximum sub-parameters per parameter (for ':' separated values like "5:1")
+const max_sub_params = 4;
 /// Maximum size for paste buffer (16MB - generous but finite to prevent OOM)
 const max_paste_len = 16 * 1024 * 1024;
 /// Bracketed paste end sequence: ESC [ 2 0 1 ~
@@ -43,12 +45,18 @@ const paste_end_seq = "\x1b[201~";
 seq_buf: [max_seq_len]u8,
 /// Current position in sequence buffer
 seq_len: usize,
-/// CSI parameters
-params: [max_params]u16,
+/// CSI parameters (first sub-param of each parameter)
+params: [max_params]u32,
+/// Sub-parameters for each parameter (params[i] is sub_params[i][0])
+sub_params: [max_params][max_sub_params]u32,
+/// Count of sub-parameters for each parameter
+sub_param_counts: [max_params]u4,
 /// Number of params parsed
 param_count: usize,
 /// Current param being built
-current_param: u16,
+current_param: u32,
+/// Current sub-parameter index within current parameter
+current_sub_idx: u4,
 /// Whether we've seen any digit for current param
 has_param: bool,
 /// Current decoder state
@@ -77,9 +85,12 @@ pub fn init(allocator: std.mem.Allocator) Decoder {
     return Decoder{
         .seq_buf = undefined,
         .seq_len = 0,
-        .params = [_]u16{0} ** max_params,
+        .params = [_]u32{0} ** max_params,
+        .sub_params = [_][max_sub_params]u32{[_]u32{0} ** max_sub_params} ** max_params,
+        .sub_param_counts = [_]u4{0} ** max_params,
         .param_count = 0,
         .current_param = 0,
+        .current_sub_idx = 0,
         .has_param = false,
         .state = .ground,
         .utf8_buf = undefined,
@@ -243,6 +254,12 @@ fn handleCsiParam(self: *Decoder, byte: u8) Result {
         return .none;
     }
 
+    // Colon - sub-parameter separator (e.g., "5:1" for modifiers:event_type)
+    if (byte == ':') {
+        self.pushSubParam();
+        return .none;
+    }
+
     // Final byte - dispatch based on it
     if (byte >= 0x40 and byte <= 0x7e) {
         self.pushParam();
@@ -250,6 +267,7 @@ fn handleCsiParam(self: *Decoder, byte: u8) Result {
     }
 
     // Intermediate byte (space, !, ", #, etc.) - store and continue
+    // Note: ':' (0x3A) is now handled above as sub-param separator
     if (byte >= 0x20 and byte < 0x40) {
         if (self.seq_len < max_seq_len) {
             self.seq_buf[self.seq_len] = byte;
@@ -459,6 +477,11 @@ fn dispatchCsi(self: *Decoder, final: u8) Result {
         return self.dispatchCsiTilde();
     }
 
+    // Kitty keyboard protocol: CSI codepoint ; modifiers u
+    if (final == 'u') {
+        return self.dispatchCsiU();
+    }
+
     // Arrow keys and other special keys
     const mods = self.getModifiers();
     const special: ?Key.Special = switch (final) {
@@ -529,16 +552,133 @@ fn dispatchCsiTilde(self: *Decoder) Result {
     return .none;
 }
 
+/// Dispatch CSI u sequences (Kitty keyboard protocol).
+/// Format: CSI unicode-key-code ; modifiers[:event-type[:shifted-key[:base-key]]] u
+/// Third param (if present) is associated text, not event type.
+///
+/// Event types: 1=press (default), 2=repeat, 3=release
+/// We ignore release events (event_type == 3).
+fn dispatchCsiU(self: *Decoder) Result {
+    // Allow sequences with intermediate bytes like '>' (CSI > flags ; ... u for capability query)
+    // But ignore them for now - they're not key events
+    if (self.seq_len != 0) {
+        // Check if this is a '?' or '>' prefix (private/query sequences)
+        if (self.seq_len == 1 and (self.seq_buf[0] == '?' or self.seq_buf[0] == '>')) {
+            return .none;
+        }
+    }
+
+    if (self.param_count == 0) return .none;
+
+    const codepoint = self.params[0];
+
+    // Codepoint 0 indicates IME input / composition - ignore for now
+    if (codepoint == 0) return .none;
+
+    // Event type from second parameter's sub-field: modifiers[:event_type]
+    // Default is 1 (press). We ignore release events (3).
+    if (self.param_count >= 2 and self.sub_param_counts[1] >= 2) {
+        const event_type = self.sub_params[1][1];
+        if (event_type == 3) {
+            // Release event - ignore
+            return .none;
+        }
+    }
+
+    // Parse modifiers from second parameter (1 + modifier bits)
+    const mod_param = if (self.param_count >= 2) self.params[1] else 1;
+    const mod_bits: u32 = if (mod_param > 0) mod_param - 1 else 0;
+    const mods = Modifiers{
+        .shift = (mod_bits & 1) != 0,
+        .alt = (mod_bits & 2) != 0,
+        .ctrl = (mod_bits & 4) != 0,
+        // Note: Kitty also has super(8), hyper(16), meta(32), caps_lock(64), num_lock(128)
+        // We don't track those yet
+    };
+
+    // Check for PUA functional keys (Private Use Area: 57344-63743)
+    // Kitty encodes special keys like F1, arrows, etc. in this range
+    if (codepoint >= 57344 and codepoint <= 63743) {
+        if (mapKittyFunctionalKey(codepoint)) |special| {
+            return .{ .event = .{ .key = Key.fromSpecial(special, mods) } };
+        }
+        // Unknown PUA key - ignore
+        return .none;
+    }
+
+    // Handle ASCII control characters (but NOT via canonicalizeControl, as that's for raw bytes)
+    // In CSI u, codepoint 9 = Tab, 13 = Enter, 27 = Escape, 127 = Backspace
+    if (codepoint == 9) return .{ .event = .{ .key = Key.fromSpecial(.tab, mods) } };
+    if (codepoint == 13) return .{ .event = .{ .key = Key.fromSpecial(.enter, mods) } };
+    if (codepoint == 27) return .{ .event = .{ .key = Key.fromSpecial(.escape, mods) } };
+    if (codepoint == 127) return .{ .event = .{ .key = Key.fromSpecial(.backspace, mods) } };
+
+    // Regular Unicode codepoint (including control codes 1-26 which represent Ctrl+A-Z)
+    if (codepoint <= 0x10FFFF) {
+        // For control codes 1-26, report as the letter with ctrl modifier
+        if (codepoint >= 1 and codepoint <= 26) {
+            const letter: u21 = 'a' + @as(u21, @intCast(codepoint)) - 1;
+            var key_mods = mods;
+            key_mods.ctrl = true;
+            return .{ .event = .{ .key = Key.fromCodepoint(letter, key_mods) } };
+        }
+        return .{ .event = .{ .key = Key.fromCodepoint(@intCast(codepoint), mods) } };
+    }
+
+    return .none;
+}
+
+/// Map Kitty PUA (Private Use Area) codepoints to Key.Special values.
+/// See: https://sw.kovidgoyal.net/kitty/keyboard-protocol/#functional-key-definitions
+/// PUA range starts at U+E000 (57344 decimal).
+fn mapKittyFunctionalKey(codepoint: u32) ?Key.Special {
+    return switch (codepoint) {
+        // Editing keys (U+E000-U+E005)
+        57344 => .escape,
+        57345 => .enter,
+        57346 => .tab,
+        57347 => .backspace,
+        57348 => .insert,
+        57349 => .delete,
+        // Navigation (U+E006-U+E00D)
+        57350 => .left,
+        57351 => .right,
+        57352 => .up,
+        57353 => .down,
+        57354 => .page_up,
+        57355 => .page_down,
+        57356 => .home,
+        57357 => .end,
+        // 57358-57363: caps_lock, scroll_lock, num_lock, print_screen, pause, menu
+        // Function keys F1-F12 (U+E014-U+E01F)
+        57364 => .f1,
+        57365 => .f2,
+        57366 => .f3,
+        57367 => .f4,
+        57368 => .f5,
+        57369 => .f6,
+        57370 => .f7,
+        57371 => .f8,
+        57372 => .f9,
+        57373 => .f10,
+        57374 => .f11,
+        57375 => .f12,
+        // F13-F24 would be 57376-57387 (if we ever add them to Key.Special)
+        else => null,
+    };
+}
+
 /// Parse SGR mouse parameters into event
 fn parseSgrMouse(self: *Decoder, is_release: bool) Result {
     if (self.param_count < 3) return .none;
 
     const cb = self.params[0];
-    const x = self.params[1];
-    const y = self.params[2];
+    // Mouse coordinates are always small enough to fit in u16
+    const x: u16 = @intCast(@min(self.params[1], 0xFFFF));
+    const y: u16 = @intCast(@min(self.params[2], 0xFFFF));
 
-    // Decode button from cb
-    const button_bits = cb & 0x43; // bits 0, 1, 6
+    // Decode button from cb (use u8 for switch since we only care about low bits)
+    const button_bits: u8 = @truncate(cb & 0x43); // bits 0, 1, 6
     const button: Mouse.Button = if (is_release)
         .release
     else switch (button_bits) {
@@ -571,7 +711,7 @@ fn getModifiers(self: *Decoder) Modifiers {
     if (self.param_count >= 2) {
         const mod_param = self.params[1];
         if (mod_param >= 1) {
-            const mod_bits = mod_param - 1;
+            const mod_bits: u32 = mod_param - 1;
             return Modifiers{
                 .shift = (mod_bits & 1) != 0,
                 .alt = (mod_bits & 2) != 0,
@@ -600,16 +740,36 @@ fn canonicalizeControl(byte: u8) Key {
 fn resetParams(self: *Decoder) void {
     self.param_count = 0;
     self.current_param = 0;
+    self.current_sub_idx = 0;
+    self.has_param = false;
+    // Clear sub-param counts for reuse
+    for (&self.sub_param_counts) |*c| c.* = 0;
+}
+
+/// Push current sub-parameter value and advance to next sub-param slot
+fn pushSubParam(self: *Decoder) void {
+    if (self.param_count < max_params and self.current_sub_idx < max_sub_params) {
+        self.sub_params[self.param_count][self.current_sub_idx] = if (self.has_param) self.current_param else 0;
+        self.current_sub_idx +|= 1;
+    }
+    self.current_param = 0;
     self.has_param = false;
 }
 
 /// Push current parameter and start new one
 fn pushParam(self: *Decoder) void {
     if (self.param_count < max_params) {
-        self.params[self.param_count] = if (self.has_param) self.current_param else 0;
+        // Store the current value as the last sub-param
+        if (self.current_sub_idx < max_sub_params) {
+            self.sub_params[self.param_count][self.current_sub_idx] = if (self.has_param) self.current_param else 0;
+            self.sub_param_counts[self.param_count] = self.current_sub_idx + 1;
+        }
+        // params[i] is the first sub-param (for backward compatibility)
+        self.params[self.param_count] = self.sub_params[self.param_count][0];
         self.param_count += 1;
     }
     self.current_param = 0;
+    self.current_sub_idx = 0;
     self.has_param = false;
 }
 
@@ -1003,5 +1163,144 @@ test "bracketed paste large content" {
     for (paste_event.?, 0..) |byte, j| {
         const expected: u8 = @intCast('A' + (j % 26));
         try std.testing.expectEqual(expected, byte);
+    }
+}
+
+test "decode CSI u key encoding (no modifiers)" {
+    var decoder = Decoder.init(std.testing.allocator);
+    defer decoder.deinit();
+
+    const seq = "\x1b[113u"; // 'q'
+    var got: ?Event.Event = null;
+
+    for (seq) |b| {
+        const res = try decoder.feed(b);
+        if (res == .event) got = res.event;
+    }
+
+    try std.testing.expect(got != null);
+    try std.testing.expect(got.? == .key);
+    try std.testing.expectEqual(@as(?u21, 'q'), got.?.key.codepoint);
+    try std.testing.expect(!got.?.key.mods.ctrl and !got.?.key.mods.alt and !got.?.key.mods.shift);
+}
+
+test "decode CSI u key encoding (ctrl modifier)" {
+    var decoder = Decoder.init(std.testing.allocator);
+    defer decoder.deinit();
+
+    // mods: 1 + ctrl(4) = 5
+    const seq = "\x1b[99;5u"; // Ctrl+c (as 'c' + ctrl modifier)
+    var got: ?Event.Event = null;
+
+    for (seq) |b| {
+        const res = try decoder.feed(b);
+        if (res == .event) got = res.event;
+    }
+
+    try std.testing.expect(got != null);
+    try std.testing.expect(got.? == .key);
+    try std.testing.expectEqual(@as(?u21, 'c'), got.?.key.codepoint);
+    try std.testing.expect(got.?.key.mods.ctrl);
+}
+
+test "decode CSI u key encoding ignores release events" {
+    var decoder = Decoder.init(std.testing.allocator);
+    defer decoder.deinit();
+
+    // Release events use sub-parameter format: modifiers:event_type
+    // Event type 3 = release
+    const seq = "\x1b[113;1:3u";
+
+    for (seq) |b| {
+        const res = try decoder.feed(b);
+        try std.testing.expect(res == .none);
+    }
+}
+
+test "decode CSI u with colon-separated event type (press)" {
+    var decoder = Decoder.init(std.testing.allocator);
+    defer decoder.deinit();
+
+    // Event type 1 = press (should produce event)
+    const seq = "\x1b[113;1:1u"; // 'q' with explicit press event
+    var got: ?Event.Event = null;
+
+    for (seq) |b| {
+        const res = try decoder.feed(b);
+        if (res == .event) got = res.event;
+    }
+
+    try std.testing.expect(got != null);
+    try std.testing.expect(got.? == .key);
+    try std.testing.expectEqual(@as(?u21, 'q'), got.?.key.codepoint);
+}
+
+test "decode CSI u with modifiers and event type" {
+    var decoder = Decoder.init(std.testing.allocator);
+    defer decoder.deinit();
+
+    // Ctrl+Q (mods=5 = 1+4) with press event (event_type=1)
+    const seq = "\x1b[113;5:1u";
+    var got: ?Event.Event = null;
+
+    for (seq) |b| {
+        const res = try decoder.feed(b);
+        if (res == .event) got = res.event;
+    }
+
+    try std.testing.expect(got != null);
+    try std.testing.expect(got.? == .key);
+    try std.testing.expectEqual(@as(?u21, 'q'), got.?.key.codepoint);
+    try std.testing.expect(got.?.key.mods.ctrl);
+    try std.testing.expect(!got.?.key.mods.shift);
+    try std.testing.expect(!got.?.key.mods.alt);
+}
+
+test "decode CSI u PUA functional key (Escape)" {
+    var decoder = Decoder.init(std.testing.allocator);
+    defer decoder.deinit();
+
+    // Kitty sends Escape as PUA codepoint 57344 (U+E000)
+    const seq = "\x1b[57344u";
+    var got: ?Event.Event = null;
+
+    for (seq) |b| {
+        const res = try decoder.feed(b);
+        if (res == .event) got = res.event;
+    }
+
+    try std.testing.expect(got != null);
+    try std.testing.expect(got.? == .key);
+    try std.testing.expect(got.?.key.special == .escape);
+}
+
+test "decode CSI u PUA functional key (F1)" {
+    var decoder = Decoder.init(std.testing.allocator);
+    defer decoder.deinit();
+
+    // Kitty sends F1 as PUA codepoint 57364
+    const seq = "\x1b[57364u";
+    var got: ?Event.Event = null;
+
+    for (seq) |b| {
+        const res = try decoder.feed(b);
+        if (res == .event) got = res.event;
+    }
+
+    try std.testing.expect(got != null);
+    try std.testing.expect(got.? == .key);
+    try std.testing.expect(got.?.key.special == .f1);
+}
+
+test "decode CSI u ignores codepoint 0 (IME composition)" {
+    var decoder = Decoder.init(std.testing.allocator);
+    defer decoder.deinit();
+
+    // Codepoint 0 is used for IME composition events
+    const seq = "\x1b[0;1u";
+
+    for (seq) |b| {
+        const res = try decoder.feed(b);
+        try std.testing.expect(res == .none);
     }
 }

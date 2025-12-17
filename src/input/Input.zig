@@ -7,6 +7,144 @@ const Decoder = @import("decoder.zig");
 /// Wraps the decoder with buffering and timeout handling for ambiguous sequences.
 pub const Input = @This();
 
+/// Optional input tracing for debugging.
+///
+/// Set `TERMCAT_TRACE_INPUT=stderr` (or `-`) to log to stderr, or set it to a
+/// file path to write logs to that file (truncated each run).
+const Trace = struct {
+    const Sink = union(enum) {
+        disabled,
+        stderr,
+        file: std.fs.File,
+    };
+
+    sink: Sink = .disabled,
+    /// Write buffer for the writer API (required in Zig 0.15+)
+    write_buf: [4096]u8 = undefined,
+
+    pub fn init() Trace {
+        const value = std.posix.getenv("TERMCAT_TRACE_INPUT") orelse return .{};
+
+        if (std.mem.eql(u8, value, "stderr") or std.mem.eql(u8, value, "-")) {
+            return .{ .sink = .stderr };
+        }
+
+        const file = std.fs.cwd().createFile(value, .{ .truncate = true }) catch return .{};
+        return .{ .sink = .{ .file = file } };
+    }
+
+    pub fn deinit(self: *Trace) void {
+        switch (self.sink) {
+            .file => |f| {
+                f.close();
+            },
+            else => {},
+        }
+        self.* = .{};
+    }
+
+    pub fn logBytes(self: *Trace, label: []const u8, bytes: []const u8) void {
+        switch (self.sink) {
+            .disabled => return,
+            .stderr => {
+                const stderr_file = std.fs.File{ .handle = posix.STDERR_FILENO };
+                var w = stderr_file.writer(&self.write_buf);
+                logBytesToWriter(&w.interface, label, bytes) catch {};
+                w.interface.flush() catch {};
+            },
+            .file => |f| {
+                var w = f.writer(&self.write_buf);
+                logBytesToWriter(&w.interface, label, bytes) catch {};
+                w.interface.flush() catch {};
+            },
+        }
+    }
+
+    pub fn logEvent(self: *Trace, event: Event.Event) void {
+        switch (self.sink) {
+            .disabled => return,
+            .stderr => {
+                const stderr_file = std.fs.File{ .handle = posix.STDERR_FILENO };
+                var w = stderr_file.writer(&self.write_buf);
+                logEventToWriter(&w.interface, event) catch {};
+                w.interface.flush() catch {};
+            },
+            .file => |f| {
+                var w = f.writer(&self.write_buf);
+                logEventToWriter(&w.interface, event) catch {};
+                w.interface.flush() catch {};
+            },
+        }
+    }
+
+    fn logBytesToWriter(w: *std.Io.Writer, label: []const u8, bytes: []const u8) !void {
+        try w.print("[input] {s}: {d} bytes | hex:", .{ label, bytes.len });
+        for (bytes) |b| {
+            try w.print(" {x:0>2}", .{b});
+        }
+
+        try w.writeAll(" | ascii: ");
+        for (bytes) |b| {
+            const ch: u8 = if (b >= 0x20 and b < 0x7f) b else '.';
+            try w.writeByte(ch);
+        }
+        try w.writeByte('\n');
+    }
+
+    fn logEventToWriter(w: *std.Io.Writer, event: Event.Event) !void {
+        switch (event) {
+            .key => |key| {
+                if (key.codepoint) |cp| {
+                    if (cp < 0x80 and cp >= 0x20) {
+                        try w.print("[event] key cp='{c}' ({d}) mods=ctrl:{d} alt:{d} shift:{d}\n", .{
+                            @as(u8, @intCast(cp)),
+                            cp,
+                            @intFromBool(key.mods.ctrl),
+                            @intFromBool(key.mods.alt),
+                            @intFromBool(key.mods.shift),
+                        });
+                    } else {
+                        try w.print("[event] key cp=U+{x} mods=ctrl:{d} alt:{d} shift:{d}\n", .{
+                            cp,
+                            @intFromBool(key.mods.ctrl),
+                            @intFromBool(key.mods.alt),
+                            @intFromBool(key.mods.shift),
+                        });
+                    }
+                } else if (key.special) |sp| {
+                    try w.print("[event] key special={s} mods=ctrl:{d} alt:{d} shift:{d}\n", .{
+                        @tagName(sp),
+                        @intFromBool(key.mods.ctrl),
+                        @intFromBool(key.mods.alt),
+                        @intFromBool(key.mods.shift),
+                    });
+                } else {
+                    try w.writeAll("[event] key <invalid>\n");
+                }
+            },
+            .mouse => |m| {
+                try w.print("[event] mouse {s} ({d},{d}) mods=ctrl:{d} alt:{d} shift:{d}\n", .{
+                    @tagName(m.button),
+                    m.x,
+                    m.y,
+                    @intFromBool(m.mods.ctrl),
+                    @intFromBool(m.mods.alt),
+                    @intFromBool(m.mods.shift),
+                });
+            },
+            .resize => |sz| {
+                try w.print("[event] resize {d}x{d}\n", .{ sz.width, sz.height });
+            },
+            .paste => |text| {
+                try w.print("[event] paste len={d}\n", .{text.len});
+            },
+            .focus => |focused| {
+                try w.print("[event] focus {s}\n", .{if (focused) "in" else "out"});
+            },
+        }
+    }
+};
+
 /// Decoder state machine
 decoder: Decoder,
 /// Raw input buffer
@@ -21,6 +159,8 @@ fd: posix.fd_t,
 escape_timeout_ms: u32,
 /// Timestamp when we entered pending state
 pending_start: ?i64,
+/// Optional trace sink (see `TERMCAT_TRACE_INPUT`)
+trace: Trace,
 
 /// Default escape timeout (50ms is common for terminal emulators)
 const default_escape_timeout_ms: u32 = 50;
@@ -35,12 +175,14 @@ pub fn init(allocator: std.mem.Allocator, fd: posix.fd_t) Input {
         .fd = fd,
         .escape_timeout_ms = default_escape_timeout_ms,
         .pending_start = null,
+        .trace = Trace.init(),
     };
 }
 
 /// Clean up resources
 pub fn deinit(self: *Input) void {
     self.decoder.deinit();
+    self.trace.deinit();
 }
 
 /// Set the escape sequence timeout in milliseconds
@@ -152,6 +294,7 @@ fn processBuffer(self: *Input) !?Event.Event {
             },
             .event => |event| {
                 self.pending_start = null;
+                self.trace.logEvent(event);
                 return event;
             },
         }
@@ -189,12 +332,16 @@ fn readInput(self: *Input) !usize {
     const space = self.input_buf.len - self.input_len;
     if (space == 0) return 0;
 
+    const start = self.input_len;
     const bytes_read = posix.read(self.fd, self.input_buf[self.input_len..]) catch |err| switch (err) {
         error.WouldBlock => return 0,
         else => return err,
     };
 
     self.input_len += bytes_read;
+    if (bytes_read > 0) {
+        self.trace.logBytes("read", self.input_buf[start..][0..bytes_read]);
+    }
     return bytes_read;
 }
 
