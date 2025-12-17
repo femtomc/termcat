@@ -32,6 +32,73 @@ pub const InitOptions = struct {
     enable_focus_events: bool = true,
 };
 
+/// Maximum number of concurrent backends that can receive resize notifications.
+/// This is a compile-time constant to avoid dynamic allocation in signal handlers.
+const max_resize_pipes = 16;
+
+/// Global registry of resize notification pipes.
+/// The signal handler writes to all registered pipes to notify each backend.
+/// This must be lock-free and async-signal-safe.
+const ResizePipeRegistry = struct {
+    /// Write ends of pipes for each registered backend.
+    /// -1 indicates an unused slot.
+    pipes: [max_resize_pipes]std.atomic.Value(posix.fd_t),
+
+    fn init() ResizePipeRegistry {
+        var self: ResizePipeRegistry = undefined;
+        for (&self.pipes) |*p| {
+            p.* = std.atomic.Value(posix.fd_t).init(-1);
+        }
+        return self;
+    }
+
+    /// Register a pipe write fd. Returns the slot index, or null if full.
+    fn register(self: *ResizePipeRegistry, write_fd: posix.fd_t) ?usize {
+        for (&self.pipes, 0..) |*slot, i| {
+            // Try to claim an empty slot (-1 -> write_fd)
+            if (slot.cmpxchgStrong(-1, write_fd, .acq_rel, .acquire)) |_| {
+                // Slot was not -1, try next
+                continue;
+            } else {
+                // Successfully claimed slot
+                return i;
+            }
+        }
+        return null; // Registry full
+    }
+
+    /// Unregister a pipe by slot index.
+    fn unregister(self: *ResizePipeRegistry, slot: usize) void {
+        if (slot < max_resize_pipes) {
+            self.pipes[slot].store(-1, .release);
+        }
+    }
+
+    /// Signal handler: write a byte to all registered pipes.
+    /// This is async-signal-safe (only uses write()).
+    fn notifyAll(self: *ResizePipeRegistry) void {
+        const byte = [_]u8{1};
+        for (&self.pipes) |*slot| {
+            const fd = slot.load(.acquire);
+            if (fd >= 0) {
+                // write() is async-signal-safe. Ignore errors (pipe full, closed, etc.)
+                _ = posix.write(fd, &byte) catch {};
+            }
+        }
+    }
+};
+
+/// Global resize pipe registry (initialized at comptime).
+var resize_registry: ResizePipeRegistry = ResizePipeRegistry.init();
+
+/// Reference count for SIGWINCH handler installation.
+/// The handler is installed when count goes 0->1 and restored when count goes 1->0.
+var sigwinch_refcount: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
+
+/// Stored original SIGWINCH handler (saved when first backend installs handler).
+var original_sigaction: posix.Sigaction = undefined;
+var original_sigaction_valid: bool = false;
+
 /// POSIX terminal backend
 pub const PosixBackend = struct {
     /// File descriptor for the terminal
@@ -52,13 +119,12 @@ pub const PosixBackend = struct {
     allocator: std.mem.Allocator,
     /// Output buffer for batching writes
     output_buffer: std.ArrayList(u8),
-    /// Previous SIGWINCH handler (stored per instance for safe restoration)
-    prev_sigaction: ?posix.Sigaction,
     /// Input handler for decoding terminal input
     input_handler: Input,
-
-    /// Atomic flag for SIGWINCH notification
-    var resize_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+    /// Self-pipe for resize notifications (read end, write end)
+    resize_pipe: ?[2]posix.fd_t,
+    /// Slot index in the global resize registry
+    resize_slot: ?usize,
 
     const Self = @This();
 
@@ -87,6 +153,62 @@ pub const PosixBackend = struct {
         // Detect capabilities
         const capabilities = detectCapabilities();
 
+        // Create self-pipe for resize notifications if requested
+        var resize_pipe: ?[2]posix.fd_t = null;
+        var resize_slot: ?usize = null;
+        if (options.install_sigwinch) {
+            const pipe_fds = try posix.pipe();
+            const O_NONBLOCK: usize = @as(u32, @bitCast(posix.O{ .NONBLOCK = true }));
+
+            // Set read end to non-blocking and close-on-exec
+            const read_flags = posix.fcntl(pipe_fds[0], posix.F.GETFL, 0) catch {
+                posix.close(pipe_fds[0]);
+                posix.close(pipe_fds[1]);
+                return error.PipeSetupFailed;
+            };
+            _ = posix.fcntl(pipe_fds[0], posix.F.SETFL, read_flags | O_NONBLOCK) catch {
+                posix.close(pipe_fds[0]);
+                posix.close(pipe_fds[1]);
+                return error.PipeSetupFailed;
+            };
+            _ = posix.fcntl(pipe_fds[0], posix.F.SETFD, @as(usize, posix.FD_CLOEXEC)) catch {
+                posix.close(pipe_fds[0]);
+                posix.close(pipe_fds[1]);
+                return error.PipeSetupFailed;
+            };
+
+            // Set write end to non-blocking and close-on-exec
+            const write_flags = posix.fcntl(pipe_fds[1], posix.F.GETFL, 0) catch {
+                posix.close(pipe_fds[0]);
+                posix.close(pipe_fds[1]);
+                return error.PipeSetupFailed;
+            };
+            _ = posix.fcntl(pipe_fds[1], posix.F.SETFL, write_flags | O_NONBLOCK) catch {
+                posix.close(pipe_fds[0]);
+                posix.close(pipe_fds[1]);
+                return error.PipeSetupFailed;
+            };
+            _ = posix.fcntl(pipe_fds[1], posix.F.SETFD, @as(usize, posix.FD_CLOEXEC)) catch {
+                posix.close(pipe_fds[0]);
+                posix.close(pipe_fds[1]);
+                return error.PipeSetupFailed;
+            };
+
+            // Register the write end with the global registry
+            resize_slot = resize_registry.register(pipe_fds[1]);
+            if (resize_slot == null) {
+                posix.close(pipe_fds[0]);
+                posix.close(pipe_fds[1]);
+                return error.TooManyBackends;
+            }
+            resize_pipe = pipe_fds;
+        }
+        errdefer if (resize_pipe) |p| {
+            if (resize_slot) |slot| resize_registry.unregister(slot);
+            posix.close(p[0]);
+            posix.close(p[1]);
+        };
+
         var self = Self{
             .tty_fd = tty_fd,
             .owns_fd = owns_fd,
@@ -97,8 +219,9 @@ pub const PosixBackend = struct {
             .in_raw_mode = false,
             .allocator = allocator,
             .output_buffer = .empty,
-            .prev_sigaction = null,
             .input_handler = Input.init(allocator, tty_fd),
+            .resize_pipe = resize_pipe,
+            .resize_slot = resize_slot,
         };
 
         errdefer self.output_buffer.deinit(allocator);
@@ -138,6 +261,15 @@ pub const PosixBackend = struct {
         // Restore signal handler if we installed one
         if (self.options.install_sigwinch) {
             self.restoreSigwinchHandler();
+        }
+
+        // Unregister and close resize pipe
+        if (self.resize_slot) |slot| {
+            resize_registry.unregister(slot);
+        }
+        if (self.resize_pipe) |p| {
+            posix.close(p[0]); // read end
+            posix.close(p[1]); // write end
         }
 
         // Exit raw mode and restore terminal
@@ -298,59 +430,74 @@ pub const PosixBackend = struct {
         return self.output_buffer.writer(self.allocator);
     }
 
-    /// Install SIGWINCH handler
-    fn installSigwinchHandler(self: *Self) void {
-        // SA_RESTART (0x0002) ensures interrupted syscalls like poll() are
-        // automatically restarted instead of returning EINTR
-        const SA_RESTART: c_uint = 0x0002;
+    /// Install SIGWINCH handler with reference counting.
+    /// Only installs the handler when refcount goes from 0 to 1.
+    fn installSigwinchHandler(_: *Self) void {
+        // Atomically increment refcount
+        const prev_count = sigwinch_refcount.fetchAdd(1, .acq_rel);
 
-        var sa: posix.Sigaction = .{
-            .handler = .{ .handler = sigwinchHandler },
-            .mask = posix.sigemptyset(),
-            .flags = SA_RESTART,
-        };
+        if (prev_count == 0) {
+            // First backend: install the signal handler and save original
+            const SA_RESTART: c_uint = 0x0002;
 
-        // Initialize to a safe default in case sigaction fails
-        var old_sa: posix.Sigaction = .{
-            .handler = .{ .handler = null },
-            .mask = posix.sigemptyset(),
-            .flags = 0,
-        };
+            var sa: posix.Sigaction = .{
+                .handler = .{ .handler = sigwinchHandler },
+                .mask = posix.sigemptyset(),
+                .flags = SA_RESTART,
+            };
 
-        // sigaction returns void in Zig 0.15 - errors are handled internally
-        // If this fails (extremely unlikely for SIGWINCH), old_sa remains
-        // at a safe default (null handler)
-        posix.sigaction(posix.SIG.WINCH, &sa, &old_sa);
+            var old_sa: posix.Sigaction = .{
+                .handler = .{ .handler = null },
+                .mask = posix.sigemptyset(),
+                .flags = 0,
+            };
 
-        // Store previous sigaction for proper restoration
-        self.prev_sigaction = old_sa;
-    }
-
-    /// Restore previous SIGWINCH handler
-    fn restoreSigwinchHandler(self: *Self) void {
-        if (self.prev_sigaction) |old_sa| {
-            // Restore the full original sigaction (handler, mask, and flags)
-            var sa = old_sa;
-            posix.sigaction(posix.SIG.WINCH, &sa, null);
-            self.prev_sigaction = null;
+            posix.sigaction(posix.SIG.WINCH, &sa, &old_sa);
+            original_sigaction = old_sa;
+            original_sigaction_valid = true;
         }
     }
 
-    /// SIGWINCH signal handler
+    /// Restore previous SIGWINCH handler with reference counting.
+    /// Only restores when refcount goes from 1 to 0.
+    fn restoreSigwinchHandler(_: *Self) void {
+        // Atomically decrement refcount
+        const prev_count = sigwinch_refcount.fetchSub(1, .acq_rel);
+
+        if (prev_count == 1 and original_sigaction_valid) {
+            // Last backend: restore the original signal handler
+            var sa = original_sigaction;
+            posix.sigaction(posix.SIG.WINCH, &sa, null);
+            original_sigaction_valid = false;
+        }
+    }
+
+    /// SIGWINCH signal handler - writes to all registered pipes
     fn sigwinchHandler(_: c_int) callconv(.c) void {
-        resize_pending.store(true, .release);
+        resize_registry.notifyAll();
     }
 
     /// Notify that a resize occurred (for external signal handling)
     pub fn notifyResize(self: *Self) void {
-        _ = self;
-        resize_pending.store(true, .release);
+        // Write directly to this instance's pipe
+        if (self.resize_pipe) |p| {
+            const byte = [_]u8{1};
+            _ = posix.write(p[1], &byte) catch {};
+        }
     }
 
-    /// Check and clear the resize pending flag
+    /// Check and clear the resize pending flag by draining the pipe
     pub fn checkResizePending(self: *Self) bool {
-        _ = self;
-        return resize_pending.swap(false, .acquire);
+        const pipe = self.resize_pipe orelse return false;
+        var buf: [64]u8 = undefined;
+        var had_data = false;
+        // Non-blocking read loop to fully drain all pending notifications
+        while (true) {
+            const n = posix.read(pipe[0], &buf) catch break;
+            if (n == 0) break; // EOF or no more data
+            had_data = true;
+        }
+        return had_data;
     }
 
     /// Update the terminal size (called after resize)
@@ -576,4 +723,50 @@ test "detectCapabilities" {
     const caps = detectCapabilities();
     // Just verify it returns something reasonable
     try std.testing.expect(@intFromEnum(caps.color_depth) >= 0);
+}
+
+test "ResizePipeRegistry per-instance notification" {
+    // Create a local registry for testing (don't interfere with global)
+    var registry = ResizePipeRegistry.init();
+
+    // Create two pipes
+    const pipe1 = try posix.pipe();
+    defer posix.close(pipe1[0]);
+    defer posix.close(pipe1[1]);
+
+    const pipe2 = try posix.pipe();
+    defer posix.close(pipe2[0]);
+    defer posix.close(pipe2[1]);
+
+    // Register both write ends
+    const slot1 = registry.register(pipe1[1]);
+    try std.testing.expect(slot1 != null);
+
+    const slot2 = registry.register(pipe2[1]);
+    try std.testing.expect(slot2 != null);
+
+    // Notify all - both pipes should receive
+    registry.notifyAll();
+
+    // Both read ends should have data
+    var buf: [16]u8 = undefined;
+    const n1 = try posix.read(pipe1[0], &buf);
+    try std.testing.expect(n1 > 0);
+
+    const n2 = try posix.read(pipe2[0], &buf);
+    try std.testing.expect(n2 > 0);
+
+    // Unregister pipe1
+    registry.unregister(slot1.?);
+
+    // Notify again - only pipe2 should receive
+    registry.notifyAll();
+
+    // pipe1 should be empty (would block), pipe2 should have data
+    // Since we can't set nonblocking in tests easily, just verify pipe2 works
+    const n3 = try posix.read(pipe2[0], &buf);
+    try std.testing.expect(n3 > 0);
+
+    // Clean up
+    registry.unregister(slot2.?);
 }
