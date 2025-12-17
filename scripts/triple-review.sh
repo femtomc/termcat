@@ -382,14 +382,14 @@ get_verdict() {
         return
     fi
 
-    # Get first non-empty line, trimmed
+    # Get first non-empty line, trimmed, uppercased (tr for portability)
     local first_line
-    first_line=$(grep -m1 -v '^[[:space:]]*$' "$file" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    first_line=$(grep -m1 -v '^[[:space:]]*$' "$file" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr '[:lower:]' '[:upper:]')
 
-    # Exact match (case-insensitive)
-    if [[ "${first_line^^}" == "LGTM" ]]; then
+    # Exact match
+    if [[ "$first_line" == "LGTM" ]]; then
         echo "LGTM"
-    elif [[ "${first_line^^}" == "CHANGES REQUESTED" ]]; then
+    elif [[ "$first_line" == "CHANGES REQUESTED" ]]; then
         echo "CHANGES REQUESTED"
     else
         echo "UNKNOWN"
