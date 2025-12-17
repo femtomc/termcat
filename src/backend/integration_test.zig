@@ -2,6 +2,7 @@ const std = @import("std");
 const posix = std.posix;
 const Pty = @import("pty.zig").Pty;
 const Decoder = @import("../input/decoder.zig");
+const Input = @import("../input/Input.zig").Input;
 const Event = @import("../Event.zig");
 const Renderer = @import("../Renderer.zig");
 const Buffer = @import("../Buffer.zig");
@@ -514,4 +515,390 @@ test "Full roundtrip: input -> decode -> process -> render -> output" {
 
     // Verify complete roundtrip
     try std.testing.expect(output.items.len > 0);
+}
+
+// =============================================================================
+// Input.pollEvent Integration Tests
+// =============================================================================
+// These tests verify the high-level Input.pollEvent function which combines
+// polling, reading, and decoding with escape timeout handling.
+
+test "Input.pollEvent returns simple key press" {
+    const pty = try Pty.open();
+    defer pty.close();
+
+    _ = try setRawMode(pty.slave);
+
+    var input = Input.init(std.testing.allocator, pty.slave);
+    defer input.deinit();
+
+    // Write a simple character through PTY
+    try pty.writeInput("a");
+
+    // pollEvent should return the key event
+    const event = try input.pollEvent(100);
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .key);
+    try std.testing.expectEqual(@as(?u21, 'a'), event.?.key.codepoint);
+}
+
+test "Input.pollEvent returns arrow key events" {
+    const pty = try Pty.open();
+    defer pty.close();
+
+    _ = try setRawMode(pty.slave);
+
+    var input = Input.init(std.testing.allocator, pty.slave);
+    defer input.deinit();
+
+    // Test all arrow keys
+    const sequences = [_]struct { seq: []const u8, expected: Event.Key.Special }{
+        .{ .seq = "\x1b[A", .expected = .up },
+        .{ .seq = "\x1b[B", .expected = .down },
+        .{ .seq = "\x1b[C", .expected = .right },
+        .{ .seq = "\x1b[D", .expected = .left },
+    };
+
+    for (sequences) |test_case| {
+        try pty.writeInput(test_case.seq);
+
+        const event = try input.pollEvent(100);
+        try std.testing.expect(event != null);
+        try std.testing.expect(event.? == .key);
+        try std.testing.expect(event.?.key.special == test_case.expected);
+    }
+}
+
+test "Input.pollEvent timeout returns null" {
+    const pty = try Pty.open();
+    defer pty.close();
+
+    _ = try setRawMode(pty.slave);
+
+    var input = Input.init(std.testing.allocator, pty.slave);
+    defer input.deinit();
+
+    // Don't write anything - should timeout
+    const start = std.time.milliTimestamp();
+    const event = try input.pollEvent(50);
+    const elapsed = std.time.milliTimestamp() - start;
+
+    try std.testing.expect(event == null);
+    // Should have waited approximately 50ms (allow some variance)
+    try std.testing.expect(elapsed >= 40 and elapsed < 200);
+}
+
+test "Input.pollEvent escape timeout emits bare escape" {
+    const pty = try Pty.open();
+    defer pty.close();
+
+    _ = try setRawMode(pty.slave);
+
+    var input = Input.init(std.testing.allocator, pty.slave);
+    defer input.deinit();
+
+    // Set a short escape timeout for faster testing
+    input.setEscapeTimeout(30);
+
+    // Write just ESC (0x1b) without any following bytes
+    try pty.writeInput("\x1b");
+
+    // pollEvent should timeout waiting for more bytes, then emit bare ESC
+    const start = std.time.milliTimestamp();
+    const event = try input.pollEvent(200);
+    const elapsed = std.time.milliTimestamp() - start;
+
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .key);
+    try std.testing.expect(event.?.key.special == .escape);
+
+    // Should have waited for escape timeout (30ms) before emitting
+    try std.testing.expect(elapsed >= 20 and elapsed < 150);
+}
+
+test "Input.pollEvent escape followed by sequence produces arrow key" {
+    const pty = try Pty.open();
+    defer pty.close();
+
+    _ = try setRawMode(pty.slave);
+
+    var input = Input.init(std.testing.allocator, pty.slave);
+    defer input.deinit();
+
+    // Write complete escape sequence for up arrow
+    try pty.writeInput("\x1b[A");
+
+    // Should get arrow key, not bare escape
+    const event = try input.pollEvent(100);
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .key);
+    try std.testing.expect(event.?.key.special == .up);
+}
+
+test "Input.pollEvent handles bracketed paste via PTY" {
+    const pty = try Pty.open();
+    defer pty.close();
+
+    _ = try setRawMode(pty.slave);
+
+    var input = Input.init(std.testing.allocator, pty.slave);
+    defer input.deinit();
+
+    // Write bracketed paste sequence
+    const paste_content = "Hello, pasted!";
+    const paste_seq = "\x1b[200~" ++ paste_content ++ "\x1b[201~";
+    try pty.writeInput(paste_seq);
+
+    // Should get paste event
+    const event = try input.pollEvent(100);
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .paste);
+    try std.testing.expectEqualStrings(paste_content, event.?.paste);
+}
+
+test "Input.pollEvent handles multi-line bracketed paste" {
+    const pty = try Pty.open();
+    defer pty.close();
+
+    _ = try setRawMode(pty.slave);
+
+    var input = Input.init(std.testing.allocator, pty.slave);
+    defer input.deinit();
+
+    // Write bracketed paste with newlines
+    const paste_content = "line1\nline2\nline3";
+    const paste_seq = "\x1b[200~" ++ paste_content ++ "\x1b[201~";
+    try pty.writeInput(paste_seq);
+
+    const event = try input.pollEvent(100);
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .paste);
+    try std.testing.expectEqualStrings(paste_content, event.?.paste);
+}
+
+test "Input.pollEvent handles bracketed paste with special characters" {
+    const pty = try Pty.open();
+    defer pty.close();
+
+    _ = try setRawMode(pty.slave);
+
+    var input = Input.init(std.testing.allocator, pty.slave);
+    defer input.deinit();
+
+    // Paste content with control characters (except ESC which would be filtered by terminals)
+    const paste_content = "tab:\there\r\nnewline";
+    const paste_seq = "\x1b[200~" ++ paste_content ++ "\x1b[201~";
+    try pty.writeInput(paste_seq);
+
+    const event = try input.pollEvent(100);
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .paste);
+    try std.testing.expectEqualStrings(paste_content, event.?.paste);
+}
+
+test "Input.pollEvent handles focus events" {
+    const pty = try Pty.open();
+    defer pty.close();
+
+    _ = try setRawMode(pty.slave);
+
+    var input = Input.init(std.testing.allocator, pty.slave);
+    defer input.deinit();
+
+    // Focus in
+    try pty.writeInput("\x1b[I");
+    var event = try input.pollEvent(100);
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .focus);
+    try std.testing.expect(event.?.focus == true);
+
+    // Focus out
+    try pty.writeInput("\x1b[O");
+    event = try input.pollEvent(100);
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .focus);
+    try std.testing.expect(event.?.focus == false);
+}
+
+test "Input.pollEvent handles mouse events" {
+    const pty = try Pty.open();
+    defer pty.close();
+
+    _ = try setRawMode(pty.slave);
+
+    var input = Input.init(std.testing.allocator, pty.slave);
+    defer input.deinit();
+
+    // SGR mouse: left click at (5, 10)
+    try pty.writeInput("\x1b[<0;5;10M");
+
+    const event = try input.pollEvent(100);
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .mouse);
+    try std.testing.expectEqual(@as(u16, 4), event.?.mouse.x); // 0-indexed
+    try std.testing.expectEqual(@as(u16, 9), event.?.mouse.y);
+    try std.testing.expect(event.?.mouse.button == .left);
+}
+
+test "Input.pollEvent handles multiple events in sequence" {
+    const pty = try Pty.open();
+    defer pty.close();
+
+    _ = try setRawMode(pty.slave);
+
+    var input = Input.init(std.testing.allocator, pty.slave);
+    defer input.deinit();
+
+    // Write multiple events
+    try pty.writeInput("abc");
+
+    // Should get each character as separate event
+    var event = try input.pollEvent(100);
+    try std.testing.expect(event != null);
+    try std.testing.expectEqual(@as(?u21, 'a'), event.?.key.codepoint);
+
+    event = try input.pollEvent(100);
+    try std.testing.expect(event != null);
+    try std.testing.expectEqual(@as(?u21, 'b'), event.?.key.codepoint);
+
+    event = try input.pollEvent(100);
+    try std.testing.expect(event != null);
+    try std.testing.expectEqual(@as(?u21, 'c'), event.?.key.codepoint);
+}
+
+test "Input.pollEvent handles interleaved events and paste" {
+    const pty = try Pty.open();
+    defer pty.close();
+
+    _ = try setRawMode(pty.slave);
+
+    var input = Input.init(std.testing.allocator, pty.slave);
+    defer input.deinit();
+
+    // Key, then paste, then key
+    try pty.writeInput("x");
+    try pty.writeInput("\x1b[200~pasted\x1b[201~");
+    try pty.writeInput("y");
+
+    // First: 'x'
+    var event = try input.pollEvent(100);
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .key);
+    try std.testing.expectEqual(@as(?u21, 'x'), event.?.key.codepoint);
+
+    // Second: paste
+    event = try input.pollEvent(100);
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .paste);
+    try std.testing.expectEqualStrings("pasted", event.?.paste);
+
+    // Third: 'y'
+    event = try input.pollEvent(100);
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .key);
+    try std.testing.expectEqual(@as(?u21, 'y'), event.?.key.codepoint);
+}
+
+test "Input.pollEvent peekEvent is non-blocking" {
+    const pty = try Pty.open();
+    defer pty.close();
+
+    _ = try setRawMode(pty.slave);
+
+    var input = Input.init(std.testing.allocator, pty.slave);
+    defer input.deinit();
+
+    // peekEvent with no data should return immediately
+    const start = std.time.milliTimestamp();
+    const event = try input.peekEvent();
+    const elapsed = std.time.milliTimestamp() - start;
+
+    try std.testing.expect(event == null);
+    // Should return very quickly (less than 20ms)
+    try std.testing.expect(elapsed < 20);
+}
+
+test "Input.pollEvent peekEvent returns event if available" {
+    const pty = try Pty.open();
+    defer pty.close();
+
+    _ = try setRawMode(pty.slave);
+
+    var input = Input.init(std.testing.allocator, pty.slave);
+    defer input.deinit();
+
+    // Write data first
+    try pty.writeInput("z");
+    std.Thread.sleep(10 * std.time.ns_per_ms); // Let it propagate
+
+    // peekEvent should return the event
+    const event = try input.peekEvent();
+    try std.testing.expect(event != null);
+    try std.testing.expectEqual(@as(?u21, 'z'), event.?.key.codepoint);
+}
+
+test "Input.pollEvent handles UTF-8 via PTY" {
+    const pty = try Pty.open();
+    defer pty.close();
+
+    _ = try setRawMode(pty.slave);
+
+    var input = Input.init(std.testing.allocator, pty.slave);
+    defer input.deinit();
+
+    // Write UTF-8 encoded é (U+00E9)
+    try pty.writeInput("\xC3\xA9");
+
+    const event = try input.pollEvent(100);
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .key);
+    try std.testing.expectEqual(@as(?u21, 0xe9), event.?.key.codepoint);
+}
+
+test "Input.pollEvent handles Alt+key via PTY" {
+    const pty = try Pty.open();
+    defer pty.close();
+
+    _ = try setRawMode(pty.slave);
+
+    var input = Input.init(std.testing.allocator, pty.slave);
+    defer input.deinit();
+
+    // ESC followed by 'a' = Alt+a
+    try pty.writeInput("\x1ba");
+
+    const event = try input.pollEvent(100);
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .key);
+    try std.testing.expectEqual(@as(?u21, 'a'), event.?.key.codepoint);
+    try std.testing.expect(event.?.key.mods.alt);
+}
+
+test "Input.pollEvent reset clears pending state" {
+    const pty = try Pty.open();
+    defer pty.close();
+
+    _ = try setRawMode(pty.slave);
+
+    var input = Input.init(std.testing.allocator, pty.slave);
+    defer input.deinit();
+
+    // Write partial escape sequence
+    try pty.writeInput("\x1b[");
+    std.Thread.sleep(10 * std.time.ns_per_ms);
+
+    // Read partial data into input buffer
+    _ = try input.pollEvent(20);
+
+    // Reset should clear pending state
+    input.reset();
+
+    // Write complete new sequence
+    try pty.writeInput("\x1b[A");
+
+    // Should get arrow key, not garbage from partial sequence
+    const event = try input.pollEvent(100);
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .key);
+    try std.testing.expect(event.?.key.special == .up);
 }
