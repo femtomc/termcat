@@ -6,10 +6,9 @@
 # This script:
 # 1. Gets issue details and modified files automatically
 # 2. Spawns Codex, Gemini, and Claude reviewers in parallel
-# 3. Waits for all to complete
-# 4. Shows the review results
-#
-# Each reviewer posts their findings via `bd comment`.
+# 3. Captures their stdout as review output
+# 4. Posts all reviews via `bd comment`
+# 5. Shows aggregated verdict summary
 
 set -euo pipefail
 
@@ -351,69 +350,64 @@ echo "  Claude PID: $CLAUDE_PID"
 echo ""
 
 wait $CODEX_PID
-CODEX_STATUS=$?
-
 wait $GEMINI_PID
-GEMINI_STATUS=$?
-
 wait $CLAUDE_PID
-CLAUDE_STATUS=$?
 
 echo ""
 echo -e "${YELLOW}Posting reviews...${NC}"
 
 # Helper to extract verdict from review output
+# Looks for exact match of "LGTM" or "CHANGES REQUESTED" on the first non-empty line
 get_verdict() {
     local file="$1"
-    if [[ -f "$file" ]]; then
-        # Look for LGTM or CHANGES REQUESTED in first few lines
-        if head -5 "$file" | grep -qi "LGTM"; then
-            echo "LGTM"
-        elif head -5 "$file" | grep -qi "CHANGES REQUESTED"; then
-            echo "CHANGES REQUESTED"
-        else
-            echo "UNKNOWN"
-        fi
-    else
+    if [[ ! -f "$file" ]]; then
         echo "FAILED"
+        return
+    fi
+
+    # Get first non-empty line, trimmed
+    local first_line
+    first_line=$(grep -m1 -v '^[[:space:]]*$' "$file" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+    # Exact match (case-insensitive)
+    if [[ "${first_line^^}" == "LGTM" ]]; then
+        echo "LGTM"
+    elif [[ "${first_line^^}" == "CHANGES REQUESTED" ]]; then
+        echo "CHANGES REQUESTED"
+    else
+        echo "UNKNOWN"
     fi
 }
 
-# Post Codex review
-CODEX_VERDICT="FAILED"
-if [[ -f "$TEMP_DIR/codex_output.txt" ]] && [[ -s "$TEMP_DIR/codex_output.txt" ]]; then
-    CODEX_VERDICT=$(get_verdict "$TEMP_DIR/codex_output.txt")
-    CODEX_REVIEW=$(cat "$TEMP_DIR/codex_output.txt")
-    bd comment "$ISSUE_ID" "CODEX REVIEW: $CODEX_REVIEW" 2>/dev/null && \
-        echo -e "  ${GREEN}✓${NC} Posted Codex review ($CODEX_VERDICT)" || \
-        echo -e "  ${RED}✗${NC} Failed to post Codex review"
-else
-    echo -e "  ${RED}✗${NC} Codex review output missing or empty"
-fi
+# Post a review, showing errors if posting fails
+# Prints status to stderr, verdict to stdout (for capture)
+post_review() {
+    local name="$1"
+    local output_file="$2"
+    local prefix="$3"
 
-# Post Gemini review
-GEMINI_VERDICT="FAILED"
-if [[ -f "$TEMP_DIR/gemini_output.txt" ]] && [[ -s "$TEMP_DIR/gemini_output.txt" ]]; then
-    GEMINI_VERDICT=$(get_verdict "$TEMP_DIR/gemini_output.txt")
-    GEMINI_REVIEW=$(cat "$TEMP_DIR/gemini_output.txt")
-    bd comment "$ISSUE_ID" "GEMINI REVIEW: $GEMINI_REVIEW" 2>/dev/null && \
-        echo -e "  ${GREEN}✓${NC} Posted Gemini review ($GEMINI_VERDICT)" || \
-        echo -e "  ${RED}✗${NC} Failed to post Gemini review"
-else
-    echo -e "  ${RED}✗${NC} Gemini review output missing or empty"
-fi
+    if [[ ! -f "$output_file" ]] || [[ ! -s "$output_file" ]]; then
+        echo -e "  ${RED}✗${NC} $name review output missing or empty" >&2
+        echo "FAILED"
+        return
+    fi
 
-# Post Claude review
-CLAUDE_VERDICT="FAILED"
-if [[ -f "$TEMP_DIR/claude_output.txt" ]] && [[ -s "$TEMP_DIR/claude_output.txt" ]]; then
-    CLAUDE_VERDICT=$(get_verdict "$TEMP_DIR/claude_output.txt")
-    CLAUDE_REVIEW=$(cat "$TEMP_DIR/claude_output.txt")
-    bd comment "$ISSUE_ID" "CLAUDE REVIEW (DESIGN): $CLAUDE_REVIEW" 2>/dev/null && \
-        echo -e "  ${GREEN}✓${NC} Posted Claude review ($CLAUDE_VERDICT)" || \
-        echo -e "  ${RED}✗${NC} Failed to post Claude review"
-else
-    echo -e "  ${RED}✗${NC} Claude review output missing or empty"
-fi
+    local verdict
+    verdict=$(get_verdict "$output_file")
+    local review_content
+    review_content=$(cat "$output_file")
+
+    if bd comment "$ISSUE_ID" "$prefix$review_content" >&2; then
+        echo -e "  ${GREEN}✓${NC} Posted $name review ($verdict)" >&2
+    else
+        echo -e "  ${RED}✗${NC} Failed to post $name review (bd comment error above)" >&2
+    fi
+    echo "$verdict"
+}
+
+CODEX_VERDICT=$(post_review "Codex" "$TEMP_DIR/codex_output.txt" "CODEX REVIEW: ")
+GEMINI_VERDICT=$(post_review "Gemini" "$TEMP_DIR/gemini_output.txt" "GEMINI REVIEW: ")
+CLAUDE_VERDICT=$(post_review "Claude" "$TEMP_DIR/claude_output.txt" "CLAUDE REVIEW (DESIGN): ")
 
 echo ""
 echo -e "${BLUE}=== Review Summary ===${NC}"
