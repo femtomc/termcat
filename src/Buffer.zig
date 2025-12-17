@@ -60,6 +60,62 @@ pub fn resize(self: *Buffer, new_size: Size) !void {
     self.height = new_size.height;
 }
 
+/// Resize the buffer to new dimensions, preserving existing content.
+/// Content that fits in the new size is copied; areas that don't fit are clipped.
+/// New areas (if the buffer grows) are filled with default cells.
+/// Wide characters clipped at the right edge are replaced with spaces to maintain
+/// the invariant that wide chars always have their continuation cell.
+pub fn resizePreserving(self: *Buffer, new_size: Size) !void {
+    // Early return if size unchanged
+    if (self.width == new_size.width and self.height == new_size.height) {
+        return;
+    }
+
+    const new_total = @as(usize, new_size.width) * @as(usize, new_size.height);
+
+    // Allocate new cells FIRST to ensure memory safety on failure
+    const new_cells = try self.allocator.alloc(Cell, new_total);
+    @memset(new_cells, Cell.default);
+
+    // Copy existing content (clipping to overlapping region)
+    const copy_width = @min(self.width, new_size.width);
+    const copy_height = @min(self.height, new_size.height);
+
+    for (0..copy_height) |y| {
+        const old_row_start = y * @as(usize, self.width);
+        const new_row_start = y * @as(usize, new_size.width);
+        @memcpy(
+            new_cells[new_row_start..][0..copy_width],
+            self.cells[old_row_start..][0..copy_width],
+        );
+
+        // Sanitize the last column if we're shrinking width.
+        // A wide char at the last column would have lost its continuation cell,
+        // violating the invariant. Replace with a space preserving style.
+        if (new_size.width > 0 and new_size.width < self.width) {
+            const last_col_idx = new_row_start + @as(usize, new_size.width) - 1;
+            const last_cell = new_cells[last_col_idx];
+            // Check if it's a wide char lead (non-continuation with width 2)
+            if (!last_cell.isContinuation() and unicode.codePointWidth(last_cell.char) == 2) {
+                // Replace with space, preserving fg/bg/attrs
+                new_cells[last_col_idx] = Cell{
+                    .char = ' ',
+                    .combining = .{ 0, 0 },
+                    .fg = last_cell.fg,
+                    .bg = last_cell.bg,
+                    .attrs = last_cell.attrs,
+                };
+            }
+        }
+    }
+
+    // Free old cells and update state
+    self.allocator.free(self.cells);
+    self.cells = new_cells;
+    self.width = new_size.width;
+    self.height = new_size.height;
+}
+
 /// Get the index into the cells array for a position
 fn index(self: Buffer, x: u16, y: u16) ?usize {
     if (x >= self.width or y >= self.height) return null;
@@ -486,6 +542,156 @@ test "Buffer resize" {
     try std.testing.expectEqual(@as(u16, 20), buf.width);
     try std.testing.expectEqual(@as(u16, 10), buf.height);
     try std.testing.expectEqual(@as(usize, 200), buf.cells.len);
+}
+
+test "Buffer resizePreserving grows buffer" {
+    var buf = try Buffer.init(std.testing.allocator, .{ .width = 5, .height = 3 });
+    defer buf.deinit();
+
+    // Set some content
+    buf.print(0, 0, "Hello", .default, .default, .{});
+    buf.print(0, 1, "World", .default, .default, .{});
+
+    // Grow the buffer
+    try buf.resizePreserving(.{ .width = 10, .height = 5 });
+
+    // Check dimensions
+    try std.testing.expectEqual(@as(u16, 10), buf.width);
+    try std.testing.expectEqual(@as(u16, 5), buf.height);
+
+    // Check original content is preserved
+    try std.testing.expectEqual(@as(u21, 'H'), buf.getCell(0, 0).char);
+    try std.testing.expectEqual(@as(u21, 'o'), buf.getCell(4, 0).char);
+    try std.testing.expectEqual(@as(u21, 'W'), buf.getCell(0, 1).char);
+    try std.testing.expectEqual(@as(u21, 'd'), buf.getCell(4, 1).char);
+
+    // Check new areas are default
+    try std.testing.expect(buf.getCell(5, 0).eql(Cell.default));
+    try std.testing.expect(buf.getCell(9, 0).eql(Cell.default));
+    try std.testing.expect(buf.getCell(0, 3).eql(Cell.default));
+    try std.testing.expect(buf.getCell(0, 4).eql(Cell.default));
+}
+
+test "Buffer resizePreserving shrinks buffer" {
+    var buf = try Buffer.init(std.testing.allocator, .{ .width = 10, .height = 5 });
+    defer buf.deinit();
+
+    // Set content that will be clipped
+    buf.print(0, 0, "Hello World", .default, .default, .{});
+    buf.print(0, 1, "Line 2", .default, .default, .{});
+    buf.print(0, 2, "Line 3", .default, .default, .{});
+    buf.print(0, 3, "Line 4", .default, .default, .{});
+    buf.print(0, 4, "Line 5", .default, .default, .{});
+
+    // Shrink the buffer
+    try buf.resizePreserving(.{ .width = 5, .height = 2 });
+
+    // Check dimensions
+    try std.testing.expectEqual(@as(u16, 5), buf.width);
+    try std.testing.expectEqual(@as(u16, 2), buf.height);
+
+    // Check content is clipped correctly (only first 5 chars of first 2 lines)
+    try std.testing.expectEqual(@as(u21, 'H'), buf.getCell(0, 0).char);
+    try std.testing.expectEqual(@as(u21, 'o'), buf.getCell(4, 0).char);
+    try std.testing.expectEqual(@as(u21, 'L'), buf.getCell(0, 1).char);
+    try std.testing.expectEqual(@as(u21, ' '), buf.getCell(4, 1).char);
+}
+
+test "Buffer resizePreserving same size" {
+    var buf = try Buffer.init(std.testing.allocator, .{ .width = 5, .height = 3 });
+    defer buf.deinit();
+
+    // Set content
+    buf.print(0, 0, "Test", .default, .default, .{});
+
+    // Resize to same dimensions
+    try buf.resizePreserving(.{ .width = 5, .height = 3 });
+
+    // Content should be preserved
+    try std.testing.expectEqual(@as(u21, 'T'), buf.getCell(0, 0).char);
+    try std.testing.expectEqual(@as(u21, 'e'), buf.getCell(1, 0).char);
+    try std.testing.expectEqual(@as(u21, 's'), buf.getCell(2, 0).char);
+    try std.testing.expectEqual(@as(u21, 't'), buf.getCell(3, 0).char);
+}
+
+test "Buffer resizePreserving mixed dimensions" {
+    var buf = try Buffer.init(std.testing.allocator, .{ .width = 5, .height = 5 });
+    defer buf.deinit();
+
+    // Set content
+    buf.print(0, 0, "AAAAA", .default, .default, .{});
+    buf.print(0, 1, "BBBBB", .default, .default, .{});
+    buf.print(0, 2, "CCCCC", .default, .default, .{});
+    buf.print(0, 3, "DDDDD", .default, .default, .{});
+    buf.print(0, 4, "EEEEE", .default, .default, .{});
+
+    // Width increases, height decreases
+    try buf.resizePreserving(.{ .width = 10, .height = 3 });
+
+    // Check dimensions
+    try std.testing.expectEqual(@as(u16, 10), buf.width);
+    try std.testing.expectEqual(@as(u16, 3), buf.height);
+
+    // Check preserved content (first 3 rows, first 5 columns)
+    try std.testing.expectEqual(@as(u21, 'A'), buf.getCell(0, 0).char);
+    try std.testing.expectEqual(@as(u21, 'A'), buf.getCell(4, 0).char);
+    try std.testing.expectEqual(@as(u21, 'B'), buf.getCell(0, 1).char);
+    try std.testing.expectEqual(@as(u21, 'C'), buf.getCell(0, 2).char);
+
+    // Check new width area is default
+    try std.testing.expect(buf.getCell(5, 0).eql(Cell.default));
+    try std.testing.expect(buf.getCell(9, 0).eql(Cell.default));
+}
+
+test "Buffer resizePreserving clips wide char at boundary" {
+    var buf = try Buffer.init(std.testing.allocator, .{ .width = 6, .height = 2 });
+    defer buf.deinit();
+
+    // Print wide char (width 2) at x=4, occupying x=4 and x=5 (continuation)
+    buf.print(4, 0, "中", Color.red, Color.blue, .{ .bold = true });
+
+    // Verify wide char is set correctly
+    try std.testing.expectEqual(@as(u21, 0x4E2D), buf.getCell(4, 0).char);
+    try std.testing.expect(buf.getCell(5, 0).isContinuation());
+
+    // Also print a wide char on row 1 at x=3 (occupies x=3 and x=4)
+    buf.print(3, 1, "日", Color.green, .default, .{});
+    try std.testing.expectEqual(@as(u21, 0x65E5), buf.getCell(3, 1).char);
+    try std.testing.expect(buf.getCell(4, 1).isContinuation());
+
+    // Shrink width from 6 to 5, clipping the continuation cell at x=5
+    try buf.resizePreserving(.{ .width = 5, .height = 2 });
+
+    // The wide char at x=4 row 0 should be replaced with space (preserving styles)
+    try std.testing.expectEqual(@as(u21, ' '), buf.getCell(4, 0).char);
+    try std.testing.expect(buf.getCell(4, 0).fg.eql(Color.red));
+    try std.testing.expect(buf.getCell(4, 0).bg.eql(Color.blue));
+    try std.testing.expect(buf.getCell(4, 0).attrs.bold);
+    // Should not be a continuation cell
+    try std.testing.expect(!buf.getCell(4, 0).isContinuation());
+
+    // The wide char at x=3 row 1 should still be intact (continuation at x=4)
+    try std.testing.expectEqual(@as(u21, 0x65E5), buf.getCell(3, 1).char);
+    try std.testing.expect(buf.getCell(4, 1).isContinuation());
+}
+
+test "Buffer resizePreserving no-op for same size" {
+    var buf = try Buffer.init(std.testing.allocator, .{ .width = 5, .height = 3 });
+    defer buf.deinit();
+
+    buf.print(0, 0, "Test", .default, .default, .{});
+
+    // Get pointer to original cells
+    const original_cells = buf.cells.ptr;
+
+    // Resize to same size - should be no-op
+    try buf.resizePreserving(.{ .width = 5, .height = 3 });
+
+    // Cells pointer should be unchanged (no reallocation)
+    try std.testing.expectEqual(original_cells, buf.cells.ptr);
+
+    // Content should be preserved
+    try std.testing.expectEqual(@as(u21, 'T'), buf.getCell(0, 0).char);
 }
 
 test "Buffer print wide characters" {
