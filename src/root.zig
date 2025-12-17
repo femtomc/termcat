@@ -21,6 +21,7 @@ pub const Plane = @import("Plane.zig");
 pub const Compositor = @import("Compositor.zig");
 pub const Blit = @import("Blit.zig");
 pub const Terminal = @import("Terminal.zig");
+pub const Layout = @import("Layout.zig");
 
 // Unicode utilities
 pub const unicode = struct {
