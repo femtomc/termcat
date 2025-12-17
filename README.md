@@ -1,5 +1,9 @@
 # termcat
 
+<p align="center">
+  <img src="logo.png" alt="termcat logo" width="400">
+</p>
+
 A minimal, fast cell-based terminal I/O library for Zig in the style of [termbox2](https://github.com/termbox/termbox2).
 
 ## Features
