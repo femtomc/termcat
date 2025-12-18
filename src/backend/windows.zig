@@ -18,6 +18,8 @@ const std = @import("std");
 const windows = std.os.windows;
 const Event = @import("../Event.zig");
 const Size = Event.Size;
+const PixelSize = Event.PixelSize;
+const CellPixelSize = Event.CellPixelSize;
 const Cell = @import("../Cell.zig");
 
 /// Color depth capability levels (re-exported from Cell.zig)
@@ -59,8 +61,10 @@ pub const WindowsBackend = struct {
     orig_output_mode: windows.DWORD,
     /// Original console output code page (for restoration)
     orig_output_cp: windows.UINT,
-    /// Current terminal size
+    /// Current terminal size in cells
     size: Size,
+    /// Current terminal size in pixels (always zero on Windows - not available via Console API)
+    pixel_size: PixelSize,
     /// Detected capabilities
     capabilities: Capabilities,
     /// Configuration options used during init
@@ -138,6 +142,9 @@ pub const WindowsBackend = struct {
             .orig_output_mode = orig_output_mode,
             .orig_output_cp = orig_output_cp,
             .size = size,
+            // Windows Console API does not provide pixel dimensions via GetConsoleScreenBufferInfo.
+            // Would require GetCurrentConsoleFontEx + GetClientRect for true pixel detection.
+            .pixel_size = PixelSize{ .width = 0, .height = 0 },
             .capabilities = capabilities,
             .options = options,
             .in_raw_mode = false,
@@ -361,12 +368,25 @@ pub const WindowsBackend = struct {
     /// Update the terminal size (called after resize)
     pub fn updateSize(self: *Self) !Size {
         self.size = try getConsoleSize(self.stdout_handle);
+        // Windows Console API does not provide pixel dimensions
         return self.size;
     }
 
-    /// Get the current terminal size
+    /// Get the current terminal size in cells
     pub fn getSize(self: *Self) Size {
         return self.size;
+    }
+
+    /// Get the current terminal size in pixels.
+    /// Always returns zero on Windows (Console API doesn't expose pixel dimensions).
+    pub fn getPixelSize(self: *Self) PixelSize {
+        return self.pixel_size;
+    }
+
+    /// Get the cell pixel size (font metrics) if known.
+    /// Always returns null on Windows (pixel dimensions not available).
+    pub fn getCellPixelSize(self: *Self) ?CellPixelSize {
+        return CellPixelSize.fromSizes(self.size, self.pixel_size);
     }
 
     /// Get console size from screen buffer info

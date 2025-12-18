@@ -2,6 +2,8 @@ const std = @import("std");
 const posix = std.posix;
 const Event = @import("../Event.zig");
 const Size = Event.Size;
+const PixelSize = Event.PixelSize;
+const CellPixelSize = Event.CellPixelSize;
 const Input = @import("../input/Input.zig");
 const Cell = @import("../Cell.zig");
 
@@ -115,8 +117,10 @@ pub const PosixBackend = struct {
     owns_fd: bool,
     /// Original terminal attributes (for restoration)
     orig_termios: posix.termios,
-    /// Current terminal size
+    /// Current terminal size in cells
     size: Size,
+    /// Current terminal size in pixels (may be zero if not supported)
+    pixel_size: PixelSize,
     /// Detected capabilities
     capabilities: Capabilities,
     /// Configuration options used during init
@@ -155,8 +159,8 @@ pub const PosixBackend = struct {
         // Get original terminal attributes
         const orig_termios = try posix.tcgetattr(tty_fd);
 
-        // Detect terminal size
-        const size = try getTerminalSize(tty_fd);
+        // Detect terminal size (cells and pixels)
+        const dims = try getTerminalDimensions(tty_fd);
 
         // Detect capabilities
         const capabilities = detectCapabilities();
@@ -225,7 +229,8 @@ pub const PosixBackend = struct {
             .input_fd = input_fd,
             .owns_fd = owns_fd,
             .orig_termios = orig_termios,
-            .size = size,
+            .size = dims.size,
+            .pixel_size = dims.pixel_size,
             .capabilities = capabilities,
             .options = options,
             .in_raw_mode = false,
@@ -538,31 +543,60 @@ pub const PosixBackend = struct {
 
     /// Update the terminal size (called after resize)
     pub fn updateSize(self: *Self) !Size {
-        self.size = try getTerminalSize(self.tty_fd);
+        const dims = try getTerminalDimensions(self.tty_fd);
+        self.size = dims.size;
+        self.pixel_size = dims.pixel_size;
         return self.size;
     }
 
-    /// Get the current terminal size
+    /// Get the current terminal size in cells
     pub fn getSize(self: *Self) Size {
         return self.size;
     }
 
-    /// Get terminal size via ioctl
-    fn getTerminalSize(fd: posix.fd_t) !Size {
+    /// Get the current terminal size in pixels.
+    /// Returns PixelSize with zero width/height if not available.
+    pub fn getPixelSize(self: *Self) PixelSize {
+        return self.pixel_size;
+    }
+
+    /// Get the cell pixel size (font metrics) if known.
+    /// Computed as pixel_size / cell_size.
+    pub fn getCellPixelSize(self: *Self) ?CellPixelSize {
+        return CellPixelSize.fromSizes(self.size, self.pixel_size);
+    }
+
+    /// Terminal dimensions returned by ioctl
+    const TerminalDimensions = struct {
+        size: Size,
+        pixel_size: PixelSize,
+    };
+
+    /// Get terminal size (cells and pixels) via ioctl
+    fn getTerminalDimensions(fd: posix.fd_t) !TerminalDimensions {
         var ws: posix.winsize = undefined;
 
         if (posix.system.ioctl(fd, posix.T.IOCGWINSZ, @intFromPtr(&ws)) != 0) {
             return error.IoctlFailed;
         }
 
-        if (ws.col == 0 or ws.row == 0) {
-            // Fallback to reasonable defaults
-            return Size{ .width = 80, .height = 24 };
-        }
+        // Cell dimensions (fallback to 80x24 if zero)
+        const size = if (ws.col == 0 or ws.row == 0)
+            Size{ .width = 80, .height = 24 }
+        else
+            Size{ .width = ws.col, .height = ws.row };
 
-        return Size{
-            .width = ws.col,
-            .height = ws.row,
+        // Pixel dimensions (zero is valid - means "not available")
+        // Many terminals and platforms (e.g., WSL, some SSH connections)
+        // do not report pixel dimensions, returning 0 for xpixel/ypixel.
+        const pixel_size = PixelSize{
+            .width = ws.xpixel,
+            .height = ws.ypixel,
+        };
+
+        return TerminalDimensions{
+            .size = size,
+            .pixel_size = pixel_size,
         };
     }
 
@@ -610,7 +644,9 @@ pub const PosixBackend = struct {
     pub fn pollEvent(self: *Self, timeout_ms: ?u32) !?Event.Event {
         // Check for pending resize first
         if (self.checkResizePending()) {
-            self.size = try getTerminalSize(self.tty_fd);
+            const dims = try getTerminalDimensions(self.tty_fd);
+            self.size = dims.size;
+            self.pixel_size = dims.pixel_size;
             return .{ .resize = self.size };
         }
 
@@ -814,4 +850,35 @@ test "synchronized output capability detected for modern terminals" {
     try std.testing.expect(isModernTerminal("xterm-ghostty"));
     try std.testing.expect(isModernTerminal("wezterm"));
     try std.testing.expect(isModernTerminal("alacritty"));
+}
+
+test "CellPixelSize computation from mocked terminal dimensions" {
+    // Mock a typical terminal setup: 80x24 cells, 1280x576 pixels
+    // This gives cell size of 16x24 pixels (common for a ~10pt monospace font)
+    const size = Size{ .width = 80, .height = 24 };
+    const pixel_size = PixelSize{ .width = 1280, .height = 576 };
+
+    const cell_px = CellPixelSize.fromSizes(size, pixel_size);
+    try std.testing.expect(cell_px != null);
+    try std.testing.expectEqual(@as(u16, 16), cell_px.?.width);
+    try std.testing.expectEqual(@as(u16, 24), cell_px.?.height);
+}
+
+test "CellPixelSize returns null for unknown pixel dimensions" {
+    const size = Size{ .width = 80, .height = 24 };
+    const unknown_pixels = PixelSize{ .width = 0, .height = 0 };
+
+    const cell_px = CellPixelSize.fromSizes(size, unknown_pixels);
+    try std.testing.expect(cell_px == null);
+}
+
+test "PixelSize isKnown detection" {
+    const known = PixelSize{ .width = 1920, .height = 1080 };
+    try std.testing.expect(known.isKnown());
+
+    const zero_width = PixelSize{ .width = 0, .height = 1080 };
+    try std.testing.expect(!zero_width.isKnown());
+
+    const zero_height = PixelSize{ .width = 1920, .height = 0 };
+    try std.testing.expect(!zero_height.isKnown());
 }

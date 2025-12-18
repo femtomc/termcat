@@ -14,10 +14,41 @@ pub const Event = union(enum) {
     focus: bool,
 };
 
-/// Terminal dimensions
+/// Terminal dimensions in cells
 pub const Size = struct {
     width: u16,
     height: u16,
+};
+
+/// Terminal dimensions in pixels.
+/// May be null/zero on platforms or terminals that don't report pixel dimensions.
+pub const PixelSize = struct {
+    width: u16,
+    height: u16,
+
+    /// Returns true if both dimensions are non-zero (i.e., pixel size is known).
+    pub fn isKnown(self: PixelSize) bool {
+        return self.width != 0 and self.height != 0;
+    }
+};
+
+/// Cell dimensions in pixels (derived from terminal pixel size / cell count).
+/// Useful for scaling pixel content to fit terminal cells.
+pub const CellPixelSize = struct {
+    width: u16,
+    height: u16,
+
+    /// Compute cell pixel size from terminal dimensions.
+    /// Returns null if pixel size is unknown (zero).
+    pub fn fromSizes(cell_size: Size, pixel_size: PixelSize) ?CellPixelSize {
+        if (!pixel_size.isKnown() or cell_size.width == 0 or cell_size.height == 0) {
+            return null;
+        }
+        return CellPixelSize{
+            .width = pixel_size.width / cell_size.width,
+            .height = pixel_size.height / cell_size.height,
+        };
+    }
 };
 
 /// Position in terminal
@@ -158,4 +189,45 @@ test "Modifiers equality" {
     const m3: Modifiers = .{ .alt = true };
     try std.testing.expect(m1.eql(m2));
     try std.testing.expect(!m1.eql(m3));
+}
+
+test "PixelSize isKnown" {
+    const known = PixelSize{ .width = 1920, .height = 1080 };
+    try std.testing.expect(known.isKnown());
+
+    const zero_width = PixelSize{ .width = 0, .height = 1080 };
+    try std.testing.expect(!zero_width.isKnown());
+
+    const zero_height = PixelSize{ .width = 1920, .height = 0 };
+    try std.testing.expect(!zero_height.isKnown());
+
+    const both_zero = PixelSize{ .width = 0, .height = 0 };
+    try std.testing.expect(!both_zero.isKnown());
+}
+
+test "CellPixelSize fromSizes" {
+    // 80x24 terminal at 1280x576 pixels = 16x24 cell size
+    const cell_size = Size{ .width = 80, .height = 24 };
+    const pixel_size = PixelSize{ .width = 1280, .height = 576 };
+
+    const cell_px = CellPixelSize.fromSizes(cell_size, pixel_size);
+    try std.testing.expect(cell_px != null);
+    try std.testing.expectEqual(@as(u16, 16), cell_px.?.width);
+    try std.testing.expectEqual(@as(u16, 24), cell_px.?.height);
+}
+
+test "CellPixelSize fromSizes with unknown pixel size" {
+    const cell_size = Size{ .width = 80, .height = 24 };
+    const unknown_pixels = PixelSize{ .width = 0, .height = 0 };
+
+    const cell_px = CellPixelSize.fromSizes(cell_size, unknown_pixels);
+    try std.testing.expect(cell_px == null);
+}
+
+test "CellPixelSize fromSizes with zero cells" {
+    const zero_cells = Size{ .width = 0, .height = 0 };
+    const pixel_size = PixelSize{ .width = 1280, .height = 576 };
+
+    const cell_px = CellPixelSize.fromSizes(zero_cells, pixel_size);
+    try std.testing.expect(cell_px == null);
 }

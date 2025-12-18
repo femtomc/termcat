@@ -35,6 +35,8 @@ pub const unicode = struct {
 // Event types
 pub const Event = @import("Event.zig");
 pub const Size = Event.Size;
+pub const PixelSize = Event.PixelSize;
+pub const CellPixelSize = Event.CellPixelSize;
 pub const Position = Event.Position;
 pub const Rect = Event.Rect;
 pub const Key = Event.Key;
