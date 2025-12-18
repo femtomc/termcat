@@ -24,6 +24,7 @@ pub const Terminal = @import("Terminal.zig");
 pub const Layout = @import("Layout.zig");
 pub const Surface = @import("Surface.zig");
 pub const Pixel = Surface.Pixel;
+pub const PixelBlitter = @import("PixelBlitter.zig");
 
 // Unicode utilities
 pub const unicode = struct {
