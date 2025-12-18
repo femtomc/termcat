@@ -67,9 +67,11 @@ Files modified:
 
 ## Process
 
+0. Review the issue, and think about it.
 1. Run `git diff '"$DIFF_SPEC"'` to see changes
 2. Read full content of modified files
 3. Check `.claude/ZIG_STYLE.md` for conventions
+4. Carefully think about the contributed code: your goal is to find problems and issues.
 
 ## Output Format
 
