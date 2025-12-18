@@ -26,6 +26,12 @@ pub const Surface = @import("Surface.zig");
 pub const Pixel = Surface.Pixel;
 pub const PixelBlitter = @import("PixelBlitter.zig");
 
+// Graphics protocols
+pub const graphics = struct {
+    pub const Kitty = @import("graphics/kitty.zig").KittyGraphics;
+    pub const KittyGraphics = Kitty;
+};
+
 // Unicode utilities
 pub const unicode = struct {
     pub const width = @import("unicode/width.zig");

@@ -37,6 +37,18 @@ pub const Capabilities = struct {
     focus_events: bool,
     /// Whether the terminal supports synchronized output (DEC mode 2026)
     synchronized_output: bool,
+    /// Whether the terminal supports Kitty graphics protocol
+    kitty_graphics: bool,
+};
+
+/// Override mode for capability detection
+pub const CapabilityOverride = enum {
+    /// Auto-detect based on environment (default)
+    auto,
+    /// Force enable
+    force_enable,
+    /// Force disable
+    force_disable,
 };
 
 /// Configuration options for terminal initialization
@@ -47,6 +59,10 @@ pub const InitOptions = struct {
     enable_focus_events: bool = true,
     /// Enable synchronized output for flicker-free rendering (DEC mode 2026)
     enable_synchronized_output: bool = true,
+    /// Override Kitty graphics capability detection.
+    /// Use force_enable for terminals that support Kitty graphics via ConPTY,
+    /// or force_disable to suppress detection.
+    kitty_graphics: CapabilityOverride = .auto,
 };
 
 /// Windows console backend
@@ -132,8 +148,8 @@ pub const WindowsBackend = struct {
         // Detect terminal size
         const size = try getConsoleSize(stdout_handle);
 
-        // Detect capabilities
-        const capabilities = detectCapabilities();
+        // Detect capabilities (with user overrides from options)
+        const capabilities = detectCapabilitiesWithOptions(options);
 
         var self = Self{
             .stdin_handle = stdin_handle,
@@ -673,8 +689,13 @@ pub const WindowsBackend = struct {
     }
 };
 
-/// Detect terminal capabilities
+/// Detect terminal capabilities from environment.
 pub fn detectCapabilities() Capabilities {
+    return detectCapabilitiesWithOptions(null);
+}
+
+/// Detect terminal capabilities with optional InitOptions overrides.
+pub fn detectCapabilitiesWithOptions(options: ?InitOptions) Capabilities {
     // Windows 10 version 1511+ supports VT sequences
     // For now, assume true color support if VT mode is available
 
@@ -684,13 +705,44 @@ pub fn detectCapabilities() Capabilities {
     const is_windows_terminal = wt_session != null;
     if (wt_session) |s| std.heap.page_allocator.free(s);
 
+    // Kitty graphics may be supported via terminals running on Windows (WezTerm, etc.)
+    // Apply override if provided
+    const kitty_graphics = if (options) |opts| switch (opts.kitty_graphics) {
+        .auto => supportsKittyGraphicsWindows(),
+        .force_enable => true,
+        .force_disable => false,
+    } else supportsKittyGraphicsWindows();
+
     return Capabilities{
         .color_depth = .true_color,
         .mouse = true,
         .bracketed_paste = false, // Not natively supported
         .focus_events = true,
         .synchronized_output = is_windows_terminal,
+        .kitty_graphics = kitty_graphics,
     };
+}
+
+/// Check if the terminal supports Kitty graphics protocol on Windows.
+/// WezTerm and other terminals can run on Windows via ConPTY.
+fn supportsKittyGraphicsWindows() bool {
+    const allocator = std.heap.page_allocator;
+
+    // Check TERM_PROGRAM (used by WezTerm and others)
+    if (std.process.getEnvVarOwned(allocator, "TERM_PROGRAM") catch null) |term_program| {
+        defer allocator.free(term_program);
+        if (std.mem.eql(u8, term_program, "WezTerm")) {
+            return true;
+        }
+    }
+
+    // Check WezTerm-specific variables
+    if (std.process.getEnvVarOwned(allocator, "WEZTERM_PANE") catch null) |v| {
+        allocator.free(v);
+        return true;
+    }
+
+    return false;
 }
 
 // Windows console API types and functions

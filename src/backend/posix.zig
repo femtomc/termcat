@@ -22,6 +22,18 @@ pub const Capabilities = struct {
     focus_events: bool,
     /// Whether the terminal supports synchronized output (DEC mode 2026)
     synchronized_output: bool,
+    /// Whether the terminal supports Kitty graphics protocol
+    kitty_graphics: bool,
+};
+
+/// Override mode for capability detection
+pub const CapabilityOverride = enum {
+    /// Auto-detect based on environment (default)
+    auto,
+    /// Force enable
+    force_enable,
+    /// Force disable
+    force_disable,
 };
 
 /// Configuration options for terminal initialization
@@ -38,6 +50,10 @@ pub const InitOptions = struct {
     enable_signals: bool = false,
     /// Enable synchronized output for flicker-free rendering (DEC mode 2026)
     enable_synchronized_output: bool = true,
+    /// Override Kitty graphics capability detection.
+    /// Use force_enable for terminals that support Kitty graphics but aren't detected
+    /// (e.g., tmux with passthrough enabled), or force_disable to suppress detection.
+    kitty_graphics: CapabilityOverride = .auto,
 };
 
 /// Maximum number of concurrent backends that can receive resize notifications.
@@ -162,8 +178,8 @@ pub const PosixBackend = struct {
         // Detect terminal size (cells and pixels)
         const dims = try getTerminalDimensions(tty_fd);
 
-        // Detect capabilities
-        const capabilities = detectCapabilities();
+        // Detect capabilities (with user overrides from options)
+        const capabilities = detectCapabilitiesWithOptions(options);
 
         // Create self-pipe for resize notifications if requested
         var resize_pipe: ?[2]posix.fd_t = null;
@@ -660,8 +676,14 @@ pub const PosixBackend = struct {
     }
 };
 
-/// Detect terminal capabilities from environment
+/// Detect terminal capabilities from environment.
+/// If options is provided, capability overrides from InitOptions are applied.
 pub fn detectCapabilities() Capabilities {
+    return detectCapabilitiesWithOptions(null);
+}
+
+/// Detect terminal capabilities with optional InitOptions overrides.
+pub fn detectCapabilitiesWithOptions(options: ?InitOptions) Capabilities {
     const term = std.posix.getenv("TERM") orelse "";
     const colorterm = std.posix.getenv("COLORTERM") orelse "";
 
@@ -672,13 +694,101 @@ pub fn detectCapabilities() Capabilities {
     // Default to conservative (false) for unknown terminals
     const is_modern = isModernTerminal(term);
 
+    // Detect Kitty graphics support, applying override if provided
+    const kitty_graphics = if (options) |opts| switch (opts.kitty_graphics) {
+        .auto => supportsKittyGraphics(term),
+        .force_enable => true,
+        .force_disable => false,
+    } else supportsKittyGraphics(term);
+
     return Capabilities{
         .color_depth = color_depth,
         .mouse = is_modern,
         .bracketed_paste = is_modern,
         .focus_events = is_modern,
         .synchronized_output = is_modern,
+        .kitty_graphics = kitty_graphics,
     };
+}
+
+/// Check if the terminal supports Kitty graphics protocol
+/// Known terminals: Kitty, WezTerm, Ghostty, Konsole (22.04+)
+fn supportsKittyGraphics(term: []const u8) bool {
+    // Guard: Multiplexers (tmux, screen) generally don't pass through Kitty graphics
+    // Even if the outer terminal supports it, the multiplexer breaks the protocol
+    if (std.posix.getenv("TMUX") != null) {
+        return false;
+    }
+    if (term.len > 0) {
+        if (std.mem.indexOf(u8, term, "screen") != null or
+            std.mem.indexOf(u8, term, "tmux") != null)
+        {
+            return false;
+        }
+    }
+
+    // Guard: Legacy/dumb terminals don't support graphics
+    if (term.len > 0 and (std.mem.eql(u8, term, "dumb") or
+        std.mem.eql(u8, term, "vt100") or
+        std.mem.eql(u8, term, "linux")))
+    {
+        return false;
+    }
+
+    // Check environment variables for terminal identification
+    // Many terminals set TERM_PROGRAM or terminal-specific variables
+
+    // Check TERM_PROGRAM (used by iTerm2, WezTerm, and others)
+    if (std.posix.getenv("TERM_PROGRAM")) |term_program| {
+        const kitty_programs = [_][]const u8{ "WezTerm", "ghostty" };
+        for (kitty_programs) |prog| {
+            if (std.mem.eql(u8, term_program, prog)) {
+                return true;
+            }
+        }
+    }
+
+    // Check WezTerm-specific variables
+    if (std.posix.getenv("WEZTERM_PANE") != null) {
+        return true;
+    }
+
+    // Check Ghostty-specific variables
+    if (std.posix.getenv("GHOSTTY_RESOURCES_DIR") != null) {
+        return true;
+    }
+
+    // Check Kitty-specific variables
+    if (std.posix.getenv("KITTY_WINDOW_ID") != null) {
+        return true;
+    }
+
+    // Check Konsole version (22.04+ supports Kitty graphics)
+    if (std.posix.getenv("KONSOLE_VERSION")) |version| {
+        // Parse major version (format: YYMMDD or similar)
+        // 220400 = 22.04.00
+        const v = std.fmt.parseInt(u32, version, 10) catch 0;
+        if (v >= 220400) {
+            return true;
+        }
+    }
+
+    // Fallback: check TERM substring (less reliable)
+    if (term.len > 0) {
+        const kitty_terms = [_][]const u8{
+            "kitty",
+            "wezterm",
+            "ghostty",
+        };
+
+        for (kitty_terms) |kitty_term| {
+            if (std.mem.indexOf(u8, term, kitty_term) != null) {
+                return true;
+            }
+        }
+    }
+
+    return false;
 }
 
 /// Detect color depth from environment variables
@@ -790,6 +900,30 @@ test "isModernTerminal unknown terminals" {
     try std.testing.expect(!isModernTerminal("dumb"));
     try std.testing.expect(!isModernTerminal("linux"));
     try std.testing.expect(!isModernTerminal(""));
+}
+
+test "supportsKittyGraphics multiplexer guard" {
+    // Multiplexers should block Kitty graphics detection via TERM
+    // (even if the TERM contains a kitty-supporting terminal name)
+    try std.testing.expect(!supportsKittyGraphics("screen"));
+    try std.testing.expect(!supportsKittyGraphics("screen-256color"));
+    try std.testing.expect(!supportsKittyGraphics("tmux"));
+    try std.testing.expect(!supportsKittyGraphics("tmux-256color"));
+}
+
+test "supportsKittyGraphics legacy terminal guard" {
+    // Legacy terminals should not report Kitty graphics support
+    try std.testing.expect(!supportsKittyGraphics("dumb"));
+    try std.testing.expect(!supportsKittyGraphics("vt100"));
+    try std.testing.expect(!supportsKittyGraphics("linux"));
+}
+
+test "supportsKittyGraphics function runs" {
+    // Basic sanity test - function should be callable
+    // Note: Actual result depends on environment variables, so we just
+    // verify the function runs without error
+    _ = supportsKittyGraphics("");
+    _ = supportsKittyGraphics("xterm-256color");
 }
 
 test "detectCapabilities" {
