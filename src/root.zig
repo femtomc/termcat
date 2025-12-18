@@ -22,6 +22,8 @@ pub const Compositor = @import("Compositor.zig");
 pub const Blit = @import("Blit.zig");
 pub const Terminal = @import("Terminal.zig");
 pub const Layout = @import("Layout.zig");
+pub const Surface = @import("Surface.zig");
+pub const Pixel = Surface.Pixel;
 
 // Unicode utilities
 pub const unicode = struct {
