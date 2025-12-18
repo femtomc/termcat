@@ -18,6 +18,8 @@ pub const Capabilities = struct {
     bracketed_paste: bool,
     /// Whether the terminal supports focus events
     focus_events: bool,
+    /// Whether the terminal supports synchronized output (DEC mode 2026)
+    synchronized_output: bool,
 };
 
 /// Configuration options for terminal initialization
@@ -32,6 +34,8 @@ pub const InitOptions = struct {
     enable_focus_events: bool = true,
     /// Leave ISIG enabled so Ctrl+C/Ctrl+Z are handled by the terminal driver
     enable_signals: bool = false,
+    /// Enable synchronized output for flicker-free rendering (DEC mode 2026)
+    enable_synchronized_output: bool = true,
 };
 
 /// Maximum number of concurrent backends that can receive resize notifications.
@@ -260,7 +264,8 @@ pub const PosixBackend = struct {
 
     /// Write cleanup sequences ignoring errors (for error path cleanup)
     fn writeCleanupSequencesIgnoreErrors(self: *Self) void {
-        const cleanup_seq = "\x1b[?1004l\x1b[?2004l\x1b[?1003l\x1b[?1006l\x1b[?25h\x1b[0m\x1b[?1049l";
+        // Disable sync output first to ensure subsequent sequences are applied immediately
+        const cleanup_seq = "\x1b[?2026l\x1b[?1004l\x1b[?2004l\x1b[?1003l\x1b[?1006l\x1b[?25h\x1b[0m\x1b[?1049l";
         _ = posix.write(self.tty_fd, cleanup_seq) catch {};
     }
 
@@ -389,6 +394,11 @@ pub const PosixBackend = struct {
     fn writeCleanupSequences(self: *Self) !void {
         const w = self.output_buffer.writer(self.allocator);
 
+        // Disable synchronized output first to ensure subsequent sequences are applied immediately
+        if (self.options.enable_synchronized_output and self.capabilities.synchronized_output) {
+            try w.writeAll("\x1b[?2026l");
+        }
+
         // Disable focus events
         if (self.options.enable_focus_events and self.capabilities.focus_events) {
             try w.writeAll("\x1b[?1004l");
@@ -436,6 +446,24 @@ pub const PosixBackend = struct {
     /// Get a writer for the output buffer
     pub fn writer(self: *Self) std.ArrayList(u8).Writer {
         return self.output_buffer.writer(self.allocator);
+    }
+
+    /// Begin synchronized output mode (DEC mode 2026).
+    /// Buffers terminal output until endSynchronizedOutput is called.
+    /// No-op if synchronized output is not enabled or not supported.
+    pub fn beginSynchronizedOutput(self: *Self) !void {
+        if (self.options.enable_synchronized_output and self.capabilities.synchronized_output) {
+            try self.output_buffer.appendSlice(self.allocator, "\x1b[?2026h");
+        }
+    }
+
+    /// End synchronized output mode (DEC mode 2026).
+    /// Flushes buffered output atomically for flicker-free rendering.
+    /// No-op if synchronized output is not enabled or not supported.
+    pub fn endSynchronizedOutput(self: *Self) !void {
+        if (self.options.enable_synchronized_output and self.capabilities.synchronized_output) {
+            try self.output_buffer.appendSlice(self.allocator, "\x1b[?2026l");
+        }
     }
 
     /// Install SIGWINCH handler with reference counting.
@@ -613,6 +641,7 @@ pub fn detectCapabilities() Capabilities {
         .mouse = is_modern,
         .bracketed_paste = is_modern,
         .focus_events = is_modern,
+        .synchronized_output = is_modern,
     };
 }
 
@@ -777,4 +806,12 @@ test "ResizePipeRegistry per-instance notification" {
 
     // Clean up
     registry.unregister(slot2.?);
+}
+
+test "synchronized output capability detected for modern terminals" {
+    // Modern terminals should have synchronized_output enabled
+    try std.testing.expect(isModernTerminal("kitty"));
+    try std.testing.expect(isModernTerminal("xterm-ghostty"));
+    try std.testing.expect(isModernTerminal("wezterm"));
+    try std.testing.expect(isModernTerminal("alacritty"));
 }

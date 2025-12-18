@@ -33,6 +33,8 @@ pub const Capabilities = struct {
     bracketed_paste: bool,
     /// Whether the terminal supports focus events
     focus_events: bool,
+    /// Whether the terminal supports synchronized output (DEC mode 2026)
+    synchronized_output: bool,
 };
 
 /// Configuration options for terminal initialization
@@ -41,6 +43,8 @@ pub const InitOptions = struct {
     enable_mouse: bool = true,
     /// Enable focus event reporting
     enable_focus_events: bool = true,
+    /// Enable synchronized output for flicker-free rendering (DEC mode 2026)
+    enable_synchronized_output: bool = true,
 };
 
 /// Windows console backend
@@ -166,7 +170,8 @@ pub const WindowsBackend = struct {
 
     /// Write cleanup sequences ignoring errors (for error path cleanup)
     fn writeCleanupSequencesIgnoreErrors(self: *Self) void {
-        const cleanup_seq = "\x1b[?25h\x1b[0m\x1b[?1049l";
+        // Disable sync output first to ensure subsequent sequences are applied immediately
+        const cleanup_seq = "\x1b[?2026l\x1b[?25h\x1b[0m\x1b[?1049l";
         var written: windows.DWORD = 0;
         _ = windows.kernel32.WriteConsoleA(
             self.stdout_handle,
@@ -285,6 +290,11 @@ pub const WindowsBackend = struct {
     fn writeCleanupSequences(self: *Self) !void {
         const w = self.output_buffer.writer(self.allocator);
 
+        // Disable synchronized output first to ensure subsequent sequences are applied immediately
+        if (self.options.enable_synchronized_output and self.capabilities.synchronized_output) {
+            try w.writeAll("\x1b[?2026l");
+        }
+
         // Show cursor
         try w.writeAll("\x1b[?25h");
 
@@ -328,6 +338,24 @@ pub const WindowsBackend = struct {
     /// Get a writer for the output buffer
     pub fn writer(self: *Self) std.ArrayList(u8).Writer {
         return self.output_buffer.writer(self.allocator);
+    }
+
+    /// Begin synchronized output mode (DEC mode 2026).
+    /// Buffers terminal output until endSynchronizedOutput is called.
+    /// No-op if synchronized output is not enabled or not supported.
+    pub fn beginSynchronizedOutput(self: *Self) !void {
+        if (self.options.enable_synchronized_output and self.capabilities.synchronized_output) {
+            try self.output_buffer.appendSlice(self.allocator, "\x1b[?2026h");
+        }
+    }
+
+    /// End synchronized output mode (DEC mode 2026).
+    /// Flushes buffered output atomically for flicker-free rendering.
+    /// No-op if synchronized output is not enabled or not supported.
+    pub fn endSynchronizedOutput(self: *Self) !void {
+        if (self.options.enable_synchronized_output and self.capabilities.synchronized_output) {
+            try self.output_buffer.appendSlice(self.allocator, "\x1b[?2026l");
+        }
     }
 
     /// Update the terminal size (called after resize)
@@ -629,11 +657,19 @@ pub const WindowsBackend = struct {
 pub fn detectCapabilities() Capabilities {
     // Windows 10 version 1511+ supports VT sequences
     // For now, assume true color support if VT mode is available
+
+    // Synchronized output (DEC mode 2026) is only supported by Windows Terminal,
+    // not legacy conhost. Detect via WT_SESSION environment variable.
+    const wt_session = std.process.getEnvVarOwned(std.heap.page_allocator, "WT_SESSION") catch null;
+    const is_windows_terminal = wt_session != null;
+    if (wt_session) |s| std.heap.page_allocator.free(s);
+
     return Capabilities{
         .color_depth = .true_color,
         .mouse = true,
         .bracketed_paste = false, // Not natively supported
         .focus_events = true,
+        .synchronized_output = is_windows_terminal,
     };
 }
 

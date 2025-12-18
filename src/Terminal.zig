@@ -228,6 +228,8 @@ pub fn invalidatePlaneMove(self: *Terminal, plane: *const Plane, old_x: i32, old
 ///
 /// This composes all visible planes and flushes the result to the terminal.
 /// Only changed regions are rendered (diff-based).
+/// Uses synchronized output (DEC mode 2026) for flicker-free rendering
+/// on terminals that support it.
 pub fn present(self: *Terminal) !void {
     // Ensure compositor targets the current renderer buffer (Terminal can be moved).
     self.compositor.target = self.renderer.buffer();
@@ -236,8 +238,17 @@ pub fn present(self: *Terminal) !void {
     const dirty_regions = try self.compositor.compose(self.root);
     defer self.allocator.free(dirty_regions);
 
+    // Begin synchronized output for flicker-free rendering
+    try self.backend.beginSynchronizedOutput();
+    // Ensure sync output is disabled on error (ignore errors in cleanup)
+    errdefer self.backend.endSynchronizedOutput() catch {};
+
     // Flush to terminal
     try self.renderer.flush(self.backend.writer());
+
+    // End synchronized output
+    try self.backend.endSynchronizedOutput();
+
     try self.backend.flushOutput();
 
     self.dirty = false;
