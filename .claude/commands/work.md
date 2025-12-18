@@ -25,21 +25,14 @@ Pick up an issue from the tracker and work it to completion.
 When you believe the implementation is complete:
 
 1. Run `zig fmt --check src/` and `zig build test` one final time
-2. Run the triple review script:
+2. Run the Codex review script:
    ```bash
-   ./scripts/triple-review.sh <issue-id>
+   ./scripts/codex-review.sh <issue-id>
    ```
 
-   This script automatically:
-   - Detects modified files from git
-   - Fetches the issue title
-   - Spawns Codex, Gemini, and Claude reviewers in parallel
-   - Waits for all three to complete
-   - Shows all review comments
-
 3. Review the results:
-   - If **any** reviewer requested changes: Address the feedback and re-run the script
-   - If **all three** say LGTM: Proceed to Phase 4
+   - If changes requested: Address the feedback and re-run the script
+   - If LGTM: Proceed to Phase 4
 
 ## Phase 4: Complete
 
@@ -63,8 +56,6 @@ When you believe the implementation is complete:
 - **Always** run `zig fmt` before completing
 - **Always** run `zig build test` before completing
 - **Do not skip the review cycle**. **DO NOT do the review yourself**.
-- ALWAYS let **all three** reviewers (Codex, Gemini, Claude) finish their reviews
-- Seriously, ALWAYS let all three reviewers finish before proceeding
-- All three reviews must pass (LGTM) before closing an issue
+- Review must pass (LGTM) before closing an issue
 - If tests fail, investigate and fix the root cause
 - If blocked, document the blocker with `bd comment`
