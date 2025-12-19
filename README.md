@@ -4,7 +4,7 @@
   <img src="logo.png" alt="termcat logo" width="400">
 </p>
 
-A fast and portable cell-based terminal I/O library in the style of [termbox2](https://github.com/termbox/termbox2) and [notcurses](github.com/dankamongmen/notcurses).
+A fast and portable cell-based terminal I/O library. Inspired by and borrowing great ideas from [termbox2](https://github.com/termbox/termbox2) and [notcurses](github.com/dankamongmen/notcurses).
 
 ## Features
 
