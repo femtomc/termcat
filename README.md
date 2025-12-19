@@ -25,7 +25,7 @@ Add termcat as a dependency in your `build.zig.zon`:
 ```zig
 .dependencies = .{
     .termcat = .{
-        .url = "https://github.com/yourusername/termcat/archive/refs/tags/v0.1.0.tar.gz",
+        .url = "https://github.com/femtomc/termcat/archive/refs/tags/v0.1.0.tar.gz",
         .hash = "...",
     },
 },
