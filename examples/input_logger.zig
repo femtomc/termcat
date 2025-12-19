@@ -16,13 +16,8 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    // Initialize the terminal backend
-    var backend = try termcat.PosixBackend.init(allocator, .{
-        .enable_mouse = true,
-        .enable_bracketed_paste = true,
-        .enable_focus_events = true,
-        .enable_signals = true,
-    });
+    // Initialize the terminal backend (cross-platform)
+    var backend = try termcat.Backend.init(allocator, .{});
     defer backend.deinit();
 
     // Create a renderer for display
@@ -37,6 +32,7 @@ pub fn main() !void {
     printSize(buf, 15, 1, size);
     buf.print(0, 2, "Color depth: ", termcat.Color.default, termcat.Color.default, .{});
     buf.print(13, 2, @tagName(backend.capabilities.color_depth), termcat.Color.cyan, termcat.Color.default, .{});
+    printCaps(buf, 0, 3, backend.capabilities);
 
     const divider = "=" ** 60;
     buf.print(0, 4, divider, termcat.Color.white, termcat.Color.default, .{});
@@ -86,6 +82,9 @@ pub fn main() !void {
                     buf.print(0, 0, "termcat Input Logger - Press 'q' or Ctrl+C to exit", termcat.Color.bright_white, termcat.Color.default, .{ .bold = true });
                     buf.print(0, 1, "Terminal size: ", termcat.Color.default, termcat.Color.default, .{});
                     printSize(buf, 15, 1, new_size);
+                    buf.print(0, 2, "Color depth: ", termcat.Color.default, termcat.Color.default, .{});
+                    buf.print(13, 2, @tagName(backend.capabilities.color_depth), termcat.Color.cyan, termcat.Color.default, .{});
+                    printCaps(buf, 0, 3, backend.capabilities);
                     buf.print(0, 4, divider, termcat.Color.white, termcat.Color.default, .{});
                     buf.print(0, 5, "Events:", termcat.Color.bright_yellow, termcat.Color.default, .{});
                     buf.print(0, event_row, "RESIZE: ", termcat.Color.green, termcat.Color.default, .{});
@@ -190,4 +189,20 @@ fn printSize(buf: *termcat.Buffer, x: u16, y: u16, size: termcat.Size) void {
     var num_buf: [16]u8 = undefined;
     const size_str = std.fmt.bufPrint(&num_buf, "{d}x{d}", .{ size.width, size.height }) catch "?x?";
     buf.print(x, y, size_str, termcat.Color.yellow, termcat.Color.default, .{});
+}
+
+fn printCaps(buf: *termcat.Buffer, x: u16, y: u16, caps: termcat.Capabilities) void {
+    var line_buf: [128]u8 = undefined;
+    const line = std.fmt.bufPrint(&line_buf, "Caps: mouse={s} paste={s} focus={s} sync={s} kitty={s}", .{
+        boolLabel(caps.mouse),
+        boolLabel(caps.bracketed_paste),
+        boolLabel(caps.focus_events),
+        boolLabel(caps.synchronized_output),
+        boolLabel(caps.kitty_graphics),
+    }) catch "Caps: ...";
+    buf.print(x, y, line, termcat.Color.bright_black, termcat.Color.default, .{});
+}
+
+fn boolLabel(value: bool) []const u8 {
+    return if (value) "on" else "off";
 }

@@ -13,11 +13,16 @@ pub fn main() !void {
 
     // Initialize terminal with mouse support
     var term = try Terminal.init(allocator, .{
-        .backend = .{ .enable_mouse = true, .enable_signals = true },
+        .backend = .{
+            .enable_mouse = true,
+            .enable_focus_events = true,
+            .enable_synchronized_output = true,
+        },
     });
     defer term.deinit();
 
     var size = term.size();
+    const caps = term.capabilities();
 
     // ═══════════════════════════════════════════════════════════════════
     // Create planes - each is an independent layer
@@ -195,7 +200,7 @@ pub fn main() !void {
         }
 
         // Update status bar
-        drawStatusBar(status, frame, mouse_x, mouse_y, term.size());
+        drawStatusBar(status, frame, mouse_x, mouse_y, size, caps);
 
         // Render!
         try term.present();
@@ -309,10 +314,11 @@ fn drawSystemInfo(plane: *Plane) void {
         "",
         "Features:",
         " - Planes & Z-order",
-        " - Auto dirty-track",
+        " - Diff rendering",
         " - True color",
         " - Mouse input",
-        " - Diff rendering",
+        " - Sync output",
+        " - Kitty graphics",
     };
 
     for (info, 0..) |line, i| {
@@ -350,6 +356,8 @@ fn drawColorPalette(plane: *Plane) void {
 
     plane.print(2, 11, "Wide: ", Color.white, dark_bg, .{});
     plane.print(8, 11, "日本語", Color.yellow, dark_bg, .{});
+    plane.print(2, 12, "Combining:", Color.white, dark_bg, .{});
+    plane.print(13, 12, "cafe\xCC\x81", Color.yellow, dark_bg, .{});
 }
 
 fn drawBall(plane: *Plane) void {
@@ -363,7 +371,7 @@ fn drawBallWithColor(plane: *Plane, rgb: Rgb) void {
     plane.setCell(2, 0, .{ .char = ')', .combining = .{ 0, 0 }, .fg = fg, .bg = .default, .attrs = .{ .bold = true } });
 }
 
-fn drawStatusBar(plane: *Plane, frame: u32, mx: i32, my: i32, size: termcat.Size) void {
+fn drawStatusBar(plane: *Plane, frame: u32, mx: i32, my: i32, size: termcat.Size, caps: termcat.Capabilities) void {
     // Clear status bar
     for (0..plane.width) |x| {
         plane.setCell(@intCast(x), 0, .{
@@ -375,8 +383,20 @@ fn drawStatusBar(plane: *Plane, frame: u32, mx: i32, my: i32, size: termcat.Size
         });
     }
 
-    var buf: [128]u8 = undefined;
-    const status_text = std.fmt.bufPrint(&buf, " [Q/q]uit [Esc] [R/r]andomize [Space]Raise | Mouse: ({d},{d}) | Frame: {d} | {d}x{d} ", .{ mx, my, frame, size.width, size.height }) catch " termcat demo ";
+    var buf: [192]u8 = undefined;
+    const status_text = std.fmt.bufPrint(
+        &buf,
+        " [Q/q]uit [Esc] [R/r]andomize [Space]Raise | Mouse: ({d},{d}) | Frame: {d} | {d}x{d} | Sync: {s} | Kitty: {s} ",
+        .{
+            mx,
+            my,
+            frame,
+            size.width,
+            size.height,
+            if (caps.synchronized_output) "on" else "off",
+            if (caps.kitty_graphics) "on" else "off",
+        },
+    ) catch " termcat demo ";
 
     plane.print(0, 0, status_text, Color.black, Color.white, .{});
 }

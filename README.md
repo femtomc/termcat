@@ -13,10 +13,13 @@ A fast and portable cell-based terminal I/O library. Inspired by and borrowing g
 - **Color support**: Automatic fallback from true color to 256 to 16 colors based on terminal capabilities
 - **Unicode support**: Wide characters (CJK, emoji) and combining marks
 - **Text attributes**: Bold, italic, underline, strikethrough, dim, reverse, blink
+- **Synchronized output**: DEC 2026 mode for flicker-free rendering on supporting terminals
+- **Kitty graphics**: Optional encoder for Kitty graphics protocol frames
 
 ## Platform Support
 
-Currently supports POSIX systems (Linux, macOS, BSD). Windows support (ConPTY/Win32) is planned.
+- POSIX (Linux, macOS, BSD)
+- Windows 10+ (Console API with VT sequences)
 
 ## Installation
 
@@ -52,33 +55,22 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    // Initialize terminal backend
-    var backend = try termcat.PosixBackend.init(allocator, .{});
-    defer backend.deinit();
+    // Initialize terminal
+    var term = try termcat.Terminal.init(allocator, .{});
+    defer term.deinit();
 
-    // Create renderer
-    const size = backend.getSize();
-    var renderer = try termcat.Renderer.init(allocator, size, backend.capabilities.color_depth);
-    defer renderer.deinit();
-
-    // Draw to buffer
-    const buf = renderer.buffer();
-    buf.print(0, 0, "Hello, termcat!", termcat.Color.green, termcat.Color.default, .{ .bold = true });
-
-    // Flush to terminal
-    try renderer.flush(backend.writer());
-    try backend.flushOutput();
+    // Draw to the root plane and present
+    term.draw(0, 0, "Hello, termcat!", termcat.Color.green, termcat.Color.default, .{ .bold = true });
+    try term.present();
 
     // Event loop
     while (true) {
-        if (try backend.pollEvent(null)) |event| {
+        if (try term.pollEvent(100)) |event| {
             switch (event) {
                 .key => |key| {
                     if (key.codepoint == 'q') return;
                 },
-                .resize => |new_size| {
-                    try renderer.resize(new_size);
-                },
+                .resize => {}, // handled internally; use this to update layout if needed
                 else => {},
             }
         }
@@ -88,16 +80,31 @@ pub fn main() !void {
 
 ## API Overview
 
-### Backend
+### Terminal
 
-`PosixBackend` handles terminal setup, capability detection, and I/O:
+`Terminal` is the high-level, cross-platform facade:
 
 ```zig
-var backend = try termcat.PosixBackend.init(allocator, .{
-    .enable_mouse = true,           // Enable mouse events
-    .enable_bracketed_paste = true, // Enable paste detection
-    .enable_focus_events = true,    // Enable focus in/out events
-    .install_sigwinch = true,       // Handle terminal resize
+var term = try termcat.Terminal.init(allocator, .{});
+defer term.deinit();
+
+term.draw(0, 0, "Hello", .green, .default, .{});
+try term.present();
+
+if (try term.pollEvent(100)) |event| { ... }
+```
+
+### Backend
+
+`Backend` handles terminal setup, capability detection, and I/O. Use
+`termcat.Backend` for the platform default, or `termcat.PosixBackend` /
+`termcat.WindowsBackend` explicitly when you need platform-specific options.
+
+```zig
+var backend = try termcat.Backend.init(allocator, .{
+    .enable_mouse = true,                // Enable mouse events
+    .enable_focus_events = true,         // Enable focus in/out events
+    .enable_synchronized_output = true,  // Flicker-free rendering (if supported)
 });
 defer backend.deinit();
 
@@ -230,6 +237,8 @@ const caps = termcat.detectCapabilities();
 // caps.mouse: bool
 // caps.bracketed_paste: bool
 // caps.focus_events: bool
+// caps.synchronized_output: bool
+// caps.kitty_graphics: bool
 ```
 
 ### Unicode Utilities
@@ -252,6 +261,12 @@ zig build input_logger
 
 # Color grid demo
 zig build color_grid
+
+# Multi-plane demo
+zig build demo
+
+# Graphics demo (PixelBlitter + Kitty graphics)
+zig build graphics_demo
 ```
 
 ## Building
@@ -269,10 +284,11 @@ zig build -Doptimize=ReleaseFast
 
 ## Known Limitations
 
-- POSIX only (Windows planned)
+- Bracketed paste is not supported on Windows
 - Maximum 2 combining marks per cell
-- No sixel/image support
-- No synchronized output (CSI ? 2026)
+- Complex grapheme clusters (ZWJ sequences) are not fully supported
+- No sixel support (Kitty graphics only)
+- Synchronized output depends on terminal support (DEC 2026 may be ignored)
 
 ## License
 

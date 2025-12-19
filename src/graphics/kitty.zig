@@ -153,13 +153,13 @@ pub const DeleteOptions = struct {
 pub fn init(allocator: std.mem.Allocator) KittyGraphics {
     return .{
         .allocator = allocator,
-        .encode_buffer = std.ArrayList(u8).init(allocator),
+        .encode_buffer = .empty,
     };
 }
 
 /// Free resources.
 pub fn deinit(self: *KittyGraphics) void {
-    self.encode_buffer.deinit();
+    self.encode_buffer.deinit(self.allocator);
     self.* = undefined;
 }
 
@@ -266,7 +266,7 @@ fn transmitImage(
 ) !void {
     // Ensure encode buffer is large enough for one chunk
     self.encode_buffer.clearRetainingCapacity();
-    try self.encode_buffer.ensureTotalCapacity(max_encoded_chunk_size + 256);
+    try self.encode_buffer.ensureTotalCapacity(self.allocator, max_encoded_chunk_size + 256);
 
     var offset: usize = 0;
     var is_first_chunk = true;
@@ -280,7 +280,7 @@ fn transmitImage(
         self.encode_buffer.clearRetainingCapacity();
         const chunk_data = pixel_data[offset..][0..chunk_size];
         const encoded_len = std.base64.standard.Encoder.calcSize(chunk_size);
-        try self.encode_buffer.resize(encoded_len);
+        try self.encode_buffer.resize(self.allocator, encoded_len);
         _ = std.base64.standard.Encoder.encode(self.encode_buffer.items, chunk_data);
 
         // Write APC sequence

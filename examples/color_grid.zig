@@ -24,10 +24,7 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     // Initialize terminal
-    var backend = try termcat.PosixBackend.init(allocator, .{
-        .enable_mouse = false,
-        .enable_signals = true,
-    });
+    var backend = try termcat.Backend.init(allocator, .{});
     defer backend.deinit();
 
     const size = backend.getSize();

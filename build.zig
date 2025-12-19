@@ -147,6 +147,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "input_logger", .path = "examples/input_logger.zig" },
         .{ .name = "color_grid", .path = "examples/color_grid.zig" },
         .{ .name = "demo", .path = "examples/demo.zig" },
+        .{ .name = "graphics_demo", .path = "examples/graphics_demo.zig" },
     };
 
     for (examples) |example| {
