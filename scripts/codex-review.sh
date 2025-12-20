@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # codex-review.sh - Run Codex code reviewer
 #
-# Usage: ./scripts/triple-review.sh <issue-id> [commit]
+# Usage: ./scripts/codex-review.sh <issue-id> [commit]
 
 set -euo pipefail
 
@@ -97,8 +97,8 @@ else
     exit 1
 fi
 
-# Extract JSON
-JSON=$(sed -n '/=== BEADS_REVIEW_START ===/,/=== BEADS_REVIEW_END ===/p' "$TEMP_FILE" | grep -v '===' | jq -c '.' 2>/dev/null || true)
+# Extract JSON (get first block only, join lines for jq)
+JSON=$(awk '/=== BEADS_REVIEW_START ===/{found=1; next} /=== BEADS_REVIEW_END ===/{if(found) exit} found' "$TEMP_FILE" | jq -c '.' 2>/dev/null || true)
 
 if [[ -z "$JSON" ]]; then
     echo -e "${RED}Failed to extract review JSON${NC}"
