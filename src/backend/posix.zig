@@ -455,16 +455,13 @@ pub const PosixBackend = struct {
         var offset: usize = 0;
         while (offset < self.output_buffer.items.len) {
             const slice = self.output_buffer.items[offset..];
-            const written = posix.write(self.tty_fd, slice) catch |err| switch (err) {
-                error.Interrupted => continue,
-                else => {
-                    if (offset > 0) {
-                        const remaining = self.output_buffer.items[offset..];
-                        std.mem.copyForwards(u8, self.output_buffer.items[0..remaining.len], remaining);
-                        self.output_buffer.items = self.output_buffer.items[0..remaining.len];
-                    }
-                    return err;
-                },
+            const written = posix.write(self.tty_fd, slice) catch |err| {
+                if (offset > 0) {
+                    const remaining = self.output_buffer.items[offset..];
+                    std.mem.copyForwards(u8, self.output_buffer.items[0..remaining.len], remaining);
+                    self.output_buffer.items = self.output_buffer.items[0..remaining.len];
+                }
+                return err;
             };
 
             if (written == 0) {
