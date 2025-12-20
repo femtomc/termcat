@@ -136,8 +136,9 @@ pub fn setCell(self: *Buffer, x: u16, y: u16, cell: Cell) void {
 /// Returns false if there's not enough room (x + 1 >= width) or out of bounds.
 /// Use this instead of setCell for CJK, emoji, and other double-width characters.
 pub fn setWideCell(self: *Buffer, x: u16, y: u16, cell: Cell) bool {
-    // Need room for both the char cell and the continuation cell
-    if (x + 1 >= self.width) return false;
+    // Need room for both the char cell and the continuation cell.
+    // Use saturating add to prevent wrap on x == maxInt(u16).
+    if (x +| 1 >= self.width) return false;
     if (y >= self.height) return false;
 
     // Set the main cell
@@ -886,4 +887,24 @@ test "Buffer print does not panic on various invalid UTF-8" {
 
     // If we get here without panic, the test passes
     // The exact output doesn't matter, just that we didn't crash
+}
+
+test "Buffer setWideCell rejects x == maxInt(u16) to prevent wrap" {
+    var buf = try Buffer.init(std.testing.allocator, .{ .width = 10, .height = 5 });
+    defer buf.deinit();
+
+    const wide_cell = Cell{
+        .char = 0x4E2D, // 中
+        .fg = .default,
+        .bg = .default,
+        .attrs = .{},
+    };
+
+    // x = maxInt(u16) is out of bounds; without saturating add, x + 1 would wrap to 0
+    // and the bounds check would incorrectly pass.
+    const result = buf.setWideCell(std.math.maxInt(u16), 0, wide_cell);
+    try std.testing.expect(!result);
+
+    // Buffer should remain unchanged (all default cells)
+    try std.testing.expect(buf.getCell(0, 0).eql(Cell.default));
 }
