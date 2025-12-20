@@ -4,10 +4,10 @@ Pick up an issue from the tracker and work it to completion.
 
 ## Phase 1: Select Issue
 
-1. Run `bd ready` to see issues with no blockers
-2. Pick the highest priority issue (P0 > P1 > P2 > P3)
-3. Run `bd show <issue-id>` to read full details
-4. Run `bd update <issue-id> --status in_progress` to claim it
+1. Run `tissue ready` to see issues with no blockers
+2. Pick the highest priority issue (P1 > P2 > P3 > P4 > P5)
+3. Run `tissue show <issue-id>` to read full details
+4. Run `tissue status <issue-id> in_progress` to claim it
 
 ## Phase 2: Implement
 
@@ -36,12 +36,11 @@ When you believe the implementation is complete:
 
 ## Phase 4: Complete
 
-1. Close the issue: `bd close <issue-id>`
+1. Close the issue: `tissue status <issue-id> closed`
 2. Commit and push:
    ```bash
    git add <modified-files>
    git commit -m "type: description"
-   bd sync
    git push
    ```
 
@@ -58,4 +57,4 @@ When you believe the implementation is complete:
 - **Do not skip the review cycle**. **DO NOT do the review yourself**.
 - Review must pass (LGTM) before closing an issue
 - If tests fail, investigate and fix the root cause
-- If blocked, document the blocker with `bd comment`
+- If blocked, document the blocker with `tissue comment <issue-id> -m "..."`

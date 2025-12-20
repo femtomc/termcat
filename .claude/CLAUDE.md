@@ -25,19 +25,20 @@ zig fmt .
 zig build-lib src/main.zig -femit-docs
 ```
 
-## Issue Tracking (Beads)
+## Issue Tracking (Tissue)
 
 ```bash
-bd list                           # List all issues
-bd ready                          # Show issues ready to work (no blockers)
-bd show <id>                      # Show issue details
-bd create "title"                 # Create new issue
-bd create "title" -t feature      # Create feature (types: bug, feature, epic)
-bd create "title" -p 1            # Create with priority (0=P0, 1=P1, 2=P2, 3=P3)
-bd update <id> --status in_progress
-bd close <id>                     # Close an issue
-bd comment <id> "message"         # Add comment to issue
-bd sync                           # Sync with git remote
+tissue list                       # List all issues
+tissue ready                      # Show issues ready to work (no blockers)
+tissue show <id>                  # Show issue details
+tissue new "title"                # Create new issue
+tissue new "title" -t feature     # Create with tag
+tissue new "title" -p 2           # Create with priority (1-5, 1=highest)
+tissue status <id> in_progress    # Update status
+tissue status <id> closed         # Close an issue
+tissue comment <id> -m "message"  # Add comment to issue
+tissue tag add <id> <tag>         # Add a tag
+tissue dep add <id> blocks <id2>  # Add dependency
 ```
 
 ## Project Structure
@@ -54,7 +55,7 @@ termcat/
 │   ├── ZIG_STYLE.md     # Zig style conventions
 │   └── commands/        # Slash commands
 │       └── work.md      # Issue workflow
-├── .beads/              # Issue tracker data
+├── .tissue/             # Issue tracker data
 └── zig-out/             # Build output
 ```
 
@@ -71,4 +72,4 @@ termcat/
 - [Zig Language Reference](https://ziglang.org/documentation/master/)
 - [Zig Standard Library](https://ziglang.org/documentation/master/std/)
 - [Zig Learn](https://ziglearn.org/)
-- [Beads Issue Tracker](https://github.com/steveyegge/beads)
+- [Tissue Issue Tracker](https://github.com/femtomc/tissue)
