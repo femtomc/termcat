@@ -71,8 +71,18 @@ pub fn size(self: Renderer) Size {
 
 /// Resize both buffers. Clears content.
 pub fn resize(self: *Renderer, new_size: Size) !void {
-    try self.front.resize(new_size);
-    try self.back.resize(new_size);
+    // Allocate new buffers first so failures don't leave front/back mismatched.
+    var new_front = try Buffer.init(self.allocator, new_size);
+    errdefer new_front.deinit();
+
+    var new_back = try Buffer.init(self.allocator, new_size);
+    errdefer new_back.deinit();
+
+    self.front.deinit();
+    self.back.deinit();
+
+    self.front = new_front;
+    self.back = new_back;
     self.needs_full_redraw = true;
 }
 

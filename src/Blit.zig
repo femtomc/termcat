@@ -128,8 +128,8 @@ pub fn blitBufferToBuffer(
     };
 
     // Clip source region to source bounds
-    const src_x = @min(src_rect.x, src.width);
-    const src_y = @min(src_rect.y, src.height);
+    var src_x = @min(src_rect.x, src.width);
+    var src_y = @min(src_rect.y, src.height);
     const src_w = @min(src_rect.width, src.width -| src_x);
     const src_h = @min(src_rect.height, src.height -| src_y);
 
@@ -141,12 +141,44 @@ pub fn blitBufferToBuffer(
 
     if (copy_w == 0 or copy_h == 0) return;
 
+    var src_buf = src;
+    var temp_buf: Buffer = undefined;
+    var has_temp = false;
+
+    if (buffersAlias(dest, src) and rectsOverlap(
+        .{ .x = src_x, .y = src_y, .width = copy_w, .height = copy_h },
+        .{ .x = dest_x, .y = dest_y, .width = copy_w, .height = copy_h },
+    )) {
+        const extra_col: u16 = if (src_x + copy_w < src.width) 1 else 0;
+        const temp_width = copy_w + extra_col;
+        const temp_height = copy_h;
+
+        if (Buffer.init(dest.allocator, .{ .width = temp_width, .height = temp_height })) |buf| {
+            temp_buf = buf;
+            has_temp = true;
+
+            var ty: u16 = 0;
+            while (ty < temp_height) : (ty += 1) {
+                var tx: u16 = 0;
+                while (tx < temp_width) : (tx += 1) {
+                    temp_buf.setCell(tx, ty, src.getCell(src_x +| tx, src_y +| ty));
+                }
+            }
+
+            src_buf = &temp_buf;
+            src_x = 0;
+            src_y = 0;
+        } else |_| {
+            // Fall back to in-place copy if allocation fails.
+        }
+    }
+
     // Perform the copy with wide character awareness
     var dy: u16 = 0;
     while (dy < copy_h) : (dy += 1) {
         var dx: u16 = 0;
         while (dx < copy_w) : (dx += 1) {
-            const cell = src.getCell(src_x +| dx, src_y +| dy);
+            const cell = src_buf.getCell(src_x +| dx, src_y +| dy);
 
             // Skip orphan continuation cells (start of source region cut a wide char)
             if (cell.isContinuation()) {
@@ -162,7 +194,7 @@ pub fn blitBufferToBuffer(
             if (options.transparent and isTransparent(cell)) continue;
 
             // Check if this is a wide character that needs its continuation
-            const is_wide = !cell.isContinuation() and isWideChar(src, src_x +| dx, src_y +| dy);
+            const is_wide = !cell.isContinuation() and isWideChar(src_buf, src_x +| dx, src_y +| dy);
 
             if (is_wide) {
                 // Check if there's room for both cells in the destination
@@ -178,7 +210,7 @@ pub fn blitBufferToBuffer(
                 } else {
                     // Copy both the base and continuation cells
                     dest.setCell(dest_x +| dx, dest_y +| dy, cell);
-                    const cont = src.getCell(src_x +| dx + 1, src_y +| dy);
+                    const cont = src_buf.getCell(src_x +| dx + 1, src_y +| dy);
                     dest.setCell(dest_x +| dx + 1, dest_y +| dy, cont);
                     dx += 1; // Skip the continuation in the next iteration
                 }
@@ -186,6 +218,10 @@ pub fn blitBufferToBuffer(
                 dest.setCell(dest_x +| dx, dest_y +| dy, cell);
             }
         }
+    }
+
+    if (has_temp) {
+        temp_buf.deinit();
     }
 }
 
@@ -196,6 +232,19 @@ fn isWideChar(buf: *const Buffer, x: u16, y: u16) bool {
     if (x + 1 >= buf.width) return false;
     const next = buf.getCell(x + 1, y);
     return next.isContinuation();
+}
+
+fn buffersAlias(dest: *const Buffer, src: *const Buffer) bool {
+    return dest.cells.ptr == src.cells.ptr;
+}
+
+fn rectsOverlap(a: Rect, b: Rect) bool {
+    const a_right = a.x +| a.width;
+    const a_bottom = a.y +| a.height;
+    const b_right = b.x +| b.width;
+    const b_bottom = b.y +| b.height;
+
+    return a.x < b_right and b.x < a_right and a.y < b_bottom and b.y < a_bottom;
 }
 
 /// Tile a source buffer repeatedly to fill a destination region.
@@ -570,6 +619,42 @@ test "blitBufferToBuffer with source region" {
     try std.testing.expectEqual(@as(u21, 'D'), dest.getCell(1, 1).char);
     // Outside sub-region should be unchanged
     try std.testing.expectEqual(@as(u21, ' '), dest.getCell(4, 0).char);
+}
+
+test "blitBufferToBuffer handles overlapping copy" {
+    const allocator = std.testing.allocator;
+
+    var buf = try Buffer.init(allocator, .{ .width = 6, .height = 1 });
+    defer buf.deinit();
+    buf.print(0, 0, "ABCDE", .default, .default, .{});
+
+    blitBufferToBuffer(&buf, 1, 0, &buf, .{
+        .src_region = .{ .x = 0, .y = 0, .width = 5, .height = 1 },
+    });
+
+    try std.testing.expectEqual(@as(u21, 'A'), buf.getCell(0, 0).char);
+    try std.testing.expectEqual(@as(u21, 'A'), buf.getCell(1, 0).char);
+    try std.testing.expectEqual(@as(u21, 'B'), buf.getCell(2, 0).char);
+    try std.testing.expectEqual(@as(u21, 'C'), buf.getCell(3, 0).char);
+    try std.testing.expectEqual(@as(u21, 'D'), buf.getCell(4, 0).char);
+    try std.testing.expectEqual(@as(u21, 'E'), buf.getCell(5, 0).char);
+}
+
+test "blitBufferToBuffer overlapping preserves wide characters" {
+    const allocator = std.testing.allocator;
+
+    var buf = try Buffer.init(allocator, .{ .width = 6, .height = 1 });
+    defer buf.deinit();
+    buf.print(0, 0, "A中B", .default, .default, .{});
+
+    blitBufferToBuffer(&buf, 1, 0, &buf, .{
+        .src_region = .{ .x = 0, .y = 0, .width = 4, .height = 1 },
+    });
+
+    try std.testing.expectEqual(@as(u21, 'A'), buf.getCell(1, 0).char);
+    try std.testing.expectEqual(@as(u21, 0x4E2D), buf.getCell(2, 0).char);
+    try std.testing.expect(buf.getCell(3, 0).isContinuation());
+    try std.testing.expectEqual(@as(u21, 'B'), buf.getCell(4, 0).char);
 }
 
 test "tileBufferToBuffer basic tiling" {

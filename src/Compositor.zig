@@ -5,13 +5,14 @@ const Plane = @import("Plane.zig").Plane;
 const Event = @import("Event.zig");
 const Size = Event.Size;
 const Rect = Event.Rect;
+const unicode = @import("unicode/width.zig");
 
 /// Compositor for merging planes into a target buffer.
 ///
 /// The compositor walks planes in z-order (back to front), applying clipping,
 /// and composing cells into the target buffer. Continuation cells (char == 0,
-/// the second half of wide characters) are never transparent - they are always
-/// copied to preserve wide character integrity.
+/// the second half of wide characters) are normally copied to preserve wide
+/// character integrity, except when clipping would create an orphan.
 ///
 /// Dirty region tracking optimizes rendering by only compositing regions that
 /// have changed since the last frame.
@@ -226,12 +227,12 @@ fn compositeRegion(self: *Compositor, dirty_rect: Rect, planes: []*const Plane) 
         const intersection = rectIntersect(dirty_rect, plane_bounds) orelse continue;
 
         // Composite the intersection
-        try self.compositePlaneRegion(plane, intersection);
+        try self.compositePlaneRegion(plane, intersection, plane_bounds);
     }
 }
 
 /// Composite a single plane's cells within the given screen region.
-fn compositePlaneRegion(self: *Compositor, plane: *const Plane, region: Rect) !void {
+fn compositePlaneRegion(self: *Compositor, plane: *const Plane, region: Rect, plane_bounds: Rect) !void {
     // Convert region to plane-local coordinates
     const local_start = plane.screenToLocal(@intCast(region.x), @intCast(region.y));
 
@@ -253,6 +254,12 @@ fn compositePlaneRegion(self: *Compositor, plane: *const Plane, region: Rect) !v
     const width = @min(region.width, plane.width -| local_x_start);
     const height = @min(region.height, plane.height -| local_y_start);
 
+    const bounds_local = plane.screenToLocal(@intCast(plane_bounds.x), @intCast(plane_bounds.y));
+    const visible_left: i32 = @max(bounds_local.x, 0);
+    const visible_top: i32 = @max(bounds_local.y, 0);
+    const visible_right: i32 = visible_left + @as(i32, plane_bounds.width);
+    const visible_bottom: i32 = visible_top + @as(i32, plane_bounds.height);
+
     var dy: u16 = 0;
     while (dy < height) : (dy += 1) {
         var dx: u16 = 0;
@@ -262,7 +269,25 @@ fn compositePlaneRegion(self: *Compositor, plane: *const Plane, region: Rect) !v
             const screen_x = screen_x_start +| dx;
             const screen_y = screen_y_start +| dy;
 
-            const cell = plane.getCell(local_x, local_y);
+            var cell = plane.getCell(local_x, local_y);
+
+            if (cell.isContinuation() and isOrphanContinuation(
+                plane,
+                local_x,
+                local_y,
+                visible_left,
+                visible_right,
+                visible_top,
+                visible_bottom,
+            )) {
+                cell = .{
+                    .char = ' ',
+                    .combining = .{ 0, 0 },
+                    .fg = cell.fg,
+                    .bg = cell.bg,
+                    .attrs = cell.attrs,
+                };
+            }
 
             // Skip transparent cells (default space with default colors)
             if (isTransparent(cell)) continue;
@@ -270,6 +295,29 @@ fn compositePlaneRegion(self: *Compositor, plane: *const Plane, region: Rect) !v
             self.target.setCell(screen_x, screen_y, cell);
         }
     }
+}
+
+fn isOrphanContinuation(
+    plane: *const Plane,
+    local_x: u16,
+    local_y: u16,
+    visible_left: i32,
+    visible_right: i32,
+    visible_top: i32,
+    visible_bottom: i32,
+) bool {
+    if (local_x == 0) return true;
+
+    const base_cell = plane.getCell(local_x - 1, local_y);
+    if (base_cell.isContinuation() or unicode.codePointWidth(base_cell.char) != 2) {
+        return true;
+    }
+
+    const base_x = @as(i32, local_x) - 1;
+    const base_y = @as(i32, local_y);
+
+    return base_x < visible_left or base_x >= visible_right or
+        base_y < visible_top or base_y >= visible_bottom;
 }
 
 /// Check if a cell is transparent (should not overwrite underlying content).
@@ -624,6 +672,53 @@ test "Compositor clipping" {
     // Only 'A' and 'B' should be visible (positions 8,3 and 9,3)
     try std.testing.expectEqual(@as(u21, 'A'), buf.getCell(8, 3).char);
     try std.testing.expectEqual(@as(u21, 'B'), buf.getCell(9, 3).char);
+}
+
+test "Compositor skips orphan continuation when base clipped" {
+    const allocator = std.testing.allocator;
+
+    var buf = try Buffer.init(allocator, .{ .width = 3, .height = 1 });
+    defer buf.deinit();
+
+    var compositor = Compositor.init(allocator, &buf);
+    defer compositor.deinit();
+
+    const root = try Plane.initRoot(allocator, .{ .width = 3, .height = 1 });
+    defer root.deinit();
+    root.print(0, 0, "RRR", .default, .default, .{});
+
+    const child = try Plane.initChild(root, -1, 0, .{ .width = 2, .height = 1 });
+    child.print(0, 0, "中", .default, .default, .{});
+
+    const dirty = try compositor.compose(root);
+    defer allocator.free(dirty);
+
+    try std.testing.expectEqual(@as(u21, 'R'), buf.getCell(0, 0).char);
+}
+
+test "Compositor preserves continuation when base is visible" {
+    const allocator = std.testing.allocator;
+
+    var buf = try Buffer.init(allocator, .{ .width = 3, .height = 1 });
+    defer buf.deinit();
+
+    var compositor = Compositor.init(allocator, &buf);
+    defer compositor.deinit();
+
+    const root = try Plane.initRoot(allocator, .{ .width = 3, .height = 1 });
+    defer root.deinit();
+
+    const child = try Plane.initChild(root, 0, 0, .{ .width = 2, .height = 1 });
+    child.print(0, 0, "中", .default, .default, .{});
+
+    const dirty1 = try compositor.compose(root);
+    defer allocator.free(dirty1);
+
+    try compositor.invalidateRect(.{ .x = 1, .y = 0, .width = 1, .height = 1 });
+    const dirty2 = try compositor.compose(root);
+    defer allocator.free(dirty2);
+
+    try std.testing.expect(buf.getCell(1, 0).isContinuation());
 }
 
 test "Compositor dirty region tracking" {

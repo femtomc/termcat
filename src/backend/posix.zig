@@ -452,10 +452,33 @@ pub const PosixBackend = struct {
     pub fn flushOutput(self: *Self) !void {
         if (self.output_buffer.items.len == 0) return;
 
-        const written = try posix.write(self.tty_fd, self.output_buffer.items);
-        if (written != self.output_buffer.items.len) {
-            return error.PartialWrite;
+        var offset: usize = 0;
+        while (offset < self.output_buffer.items.len) {
+            const slice = self.output_buffer.items[offset..];
+            const written = posix.write(self.tty_fd, slice) catch |err| switch (err) {
+                error.Interrupted => continue,
+                else => {
+                    if (offset > 0) {
+                        const remaining = self.output_buffer.items[offset..];
+                        std.mem.copyForwards(u8, self.output_buffer.items[0..remaining.len], remaining);
+                        self.output_buffer.items = self.output_buffer.items[0..remaining.len];
+                    }
+                    return err;
+                },
+            };
+
+            if (written == 0) {
+                if (offset > 0) {
+                    const remaining = self.output_buffer.items[offset..];
+                    std.mem.copyForwards(u8, self.output_buffer.items[0..remaining.len], remaining);
+                    self.output_buffer.items = self.output_buffer.items[0..remaining.len];
+                }
+                return error.WriteError;
+            }
+
+            offset += written;
         }
+
         self.output_buffer.clearRetainingCapacity();
     }
 
@@ -664,6 +687,25 @@ pub const PosixBackend = struct {
             self.size = dims.size;
             self.pixel_size = dims.pixel_size;
             return .{ .resize = self.size };
+        }
+
+        if (self.resize_pipe) |pipe| {
+            const result = try self.input_handler.pollEventWithExtraFd(timeout_ms, pipe[0]);
+            if (result) |outcome| {
+                switch (outcome) {
+                    .event => |event| return event,
+                    .extra_ready => {
+                        if (self.checkResizePending()) {
+                            const dims = try getTerminalDimensions(self.tty_fd);
+                            self.size = dims.size;
+                            self.pixel_size = dims.pixel_size;
+                            return .{ .resize = self.size };
+                        }
+                        return null;
+                    },
+                }
+            }
+            return null;
         }
 
         // Poll for input events

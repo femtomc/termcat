@@ -334,22 +334,39 @@ pub const WindowsBackend = struct {
     pub fn flushOutput(self: *Self) !void {
         if (self.output_buffer.items.len == 0) return;
 
-        var written: windows.DWORD = 0;
-        const result = windows.kernel32.WriteConsoleA(
-            self.stdout_handle,
-            self.output_buffer.items.ptr,
-            @intCast(self.output_buffer.items.len),
-            &written,
-            null,
-        );
+        var offset: usize = 0;
+        while (offset < self.output_buffer.items.len) {
+            var written: windows.DWORD = 0;
+            const slice = self.output_buffer.items[offset..];
+            const result = windows.kernel32.WriteConsoleA(
+                self.stdout_handle,
+                slice.ptr,
+                @intCast(slice.len),
+                &written,
+                null,
+            );
 
-        if (result == 0) {
-            return error.WriteError;
+            if (result == 0) {
+                if (offset > 0) {
+                    const remaining = self.output_buffer.items[offset..];
+                    std.mem.copyForwards(u8, self.output_buffer.items[0..remaining.len], remaining);
+                    self.output_buffer.items = self.output_buffer.items[0..remaining.len];
+                }
+                return error.WriteError;
+            }
+
+            if (written == 0) {
+                if (offset > 0) {
+                    const remaining = self.output_buffer.items[offset..];
+                    std.mem.copyForwards(u8, self.output_buffer.items[0..remaining.len], remaining);
+                    self.output_buffer.items = self.output_buffer.items[0..remaining.len];
+                }
+                return error.WriteError;
+            }
+
+            offset += written;
         }
 
-        if (written != self.output_buffer.items.len) {
-            return error.PartialWrite;
-        }
         self.output_buffer.clearRetainingCapacity();
     }
 

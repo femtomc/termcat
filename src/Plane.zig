@@ -143,9 +143,37 @@ pub fn move(self: *Plane, new_x: i32, new_y: i32) void {
 
 /// Resize this plane. Clears the buffer content.
 pub fn resize(self: *Plane, new_size: Size) !void {
+    const old_width = self.width;
+    const old_height = self.height;
+    const old_x = self.x;
+    const old_y = self.y;
+
     try self.buffer.resize(new_size);
     self.width = new_size.width;
     self.height = new_size.height;
+    self.markAllDirty();
+
+    if (self.parent) |parent| {
+        // Invalidate the old bounds on the parent so shrink clears stale content.
+        const old_right = old_x + @as(i32, old_width);
+        const old_bottom = old_y + @as(i32, old_height);
+        const parent_right = @as(i32, parent.width);
+        const parent_bottom = @as(i32, parent.height);
+
+        const clipped_left = @max(old_x, 0);
+        const clipped_top = @max(old_y, 0);
+        const clipped_right = @min(old_right, parent_right);
+        const clipped_bottom = @min(old_bottom, parent_bottom);
+
+        if (clipped_left < clipped_right and clipped_top < clipped_bottom) {
+            parent.markDirtyRect(.{
+                .x = @intCast(clipped_left),
+                .y = @intCast(clipped_top),
+                .width = @intCast(clipped_right - clipped_left),
+                .height = @intCast(clipped_bottom - clipped_top),
+            });
+        }
+    }
 }
 
 /// Set visibility of this plane and its children.
@@ -1218,6 +1246,34 @@ test "clear marks entire plane dirty" {
     try std.testing.expectEqual(@as(u16, 0), dirty.y);
     try std.testing.expectEqual(@as(u16, 40), dirty.width);
     try std.testing.expectEqual(@as(u16, 20), dirty.height);
+}
+
+test "resize marks plane dirty and invalidates parent" {
+    const allocator = std.testing.allocator;
+
+    const root = try Plane.initRoot(allocator, .{ .width = 20, .height = 10 });
+    defer root.deinit();
+
+    const child = try Plane.initChild(root, 3, 2, .{ .width = 6, .height = 4 });
+
+    try std.testing.expect(!root.isDirty());
+    try std.testing.expect(!child.isDirty());
+
+    try child.resize(.{ .width = 4, .height = 3 });
+
+    try std.testing.expect(child.isDirty());
+    const child_dirty = child.dirty_rect.?;
+    try std.testing.expectEqual(@as(u16, 0), child_dirty.x);
+    try std.testing.expectEqual(@as(u16, 0), child_dirty.y);
+    try std.testing.expectEqual(@as(u16, 4), child_dirty.width);
+    try std.testing.expectEqual(@as(u16, 3), child_dirty.height);
+
+    try std.testing.expect(root.isDirty());
+    const root_dirty = root.dirty_rect.?;
+    try std.testing.expectEqual(@as(u16, 3), root_dirty.x);
+    try std.testing.expectEqual(@as(u16, 2), root_dirty.y);
+    try std.testing.expectEqual(@as(u16, 6), root_dirty.width);
+    try std.testing.expectEqual(@as(u16, 4), root_dirty.height);
 }
 
 test "multiple operations expand dirty region" {

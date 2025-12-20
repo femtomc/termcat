@@ -7,6 +7,18 @@ const Decoder = @import("decoder.zig");
 /// Wraps the decoder with buffering and timeout handling for ambiguous sequences.
 pub const Input = @This();
 
+pub const PollResult = union(enum) {
+    event: Event.Event,
+    extra_ready,
+};
+
+const ReadResult = union(enum) {
+    read: usize,
+    would_block,
+    no_space,
+    eof,
+};
+
 /// Optional input tracing for debugging.
 ///
 /// Set `TERMCAT_TRACE_INPUT=stderr` (or `-`) to log to stderr, or set it to a
@@ -198,13 +210,30 @@ pub fn setEscapeTimeout(self: *Input, timeout_ms: u32) void {
 /// - Poll/read from the file descriptor
 /// - Escape sequence timeout for ambiguous sequences (bare ESC vs ESC + more)
 pub fn pollEvent(self: *Input, timeout_ms: ?u32) !?Event.Event {
+    const result = try self.pollEventInternal(timeout_ms, null);
+    if (result) |outcome| {
+        switch (outcome) {
+            .event => |event| return event,
+            .extra_ready => return null,
+        }
+    }
+    return null;
+}
+
+/// Poll for an event, but also return if an extra fd becomes readable.
+/// Returns .extra_ready when the extra fd is readable.
+pub fn pollEventWithExtraFd(self: *Input, timeout_ms: ?u32, extra_fd: posix.fd_t) !?PollResult {
+    return self.pollEventInternal(timeout_ms, extra_fd);
+}
+
+fn pollEventInternal(self: *Input, timeout_ms: ?u32, extra_fd: ?posix.fd_t) !?PollResult {
     // Track deadline for timeout handling
     const start_time = std.time.milliTimestamp();
 
     while (true) {
         // First, try to get an event from buffered input
         if (try self.processBuffer()) |event| {
-            return event;
+            return .{ .event = event };
         }
 
         // Calculate remaining timeout
@@ -225,30 +254,37 @@ pub fn pollEvent(self: *Input, timeout_ms: ?u32) !?Event.Event {
         if (self.decoder.isPending() and self.checkEscapeTimeout()) {
             // Timeout expired - emit pending escape
             if (self.decoder.reset()) |event| {
-                return event;
+                return .{ .event = event };
             }
         }
 
         // Poll for input
-        const poll_result = try self.pollFd(effective_timeout);
+        const poll_result = try self.pollFds(effective_timeout, extra_fd);
 
-        if (poll_result > 0) {
+        if (poll_result.extra_ready) {
+            return .extra_ready;
+        }
+
+        if (poll_result.input_ready) {
             // Data available - read it
-            const bytes_read = try self.readInput();
-            if (bytes_read == 0) {
-                // poll() reported ready but read() returned 0
-                // This indicates EOF (TTY hangup, closed fd)
-                return error.EndOfStream;
+            const read_result = try self.readInput();
+            switch (read_result) {
+                .read => |bytes_read| {
+                    if (bytes_read > 0) {
+                        // We read data, loop back to process it
+                        continue;
+                    }
+                },
+                .eof => return error.EndOfStream,
+                .would_block, .no_space => {},
             }
-            // We read data, loop back to process it
-            continue;
         }
 
         // No data available (timeout on poll)
         // Check for escape timeout
         if (self.decoder.isPending() and self.checkEscapeTimeout()) {
             if (self.decoder.reset()) |event| {
-                return event;
+                return .{ .event = event };
             }
         }
 
@@ -308,41 +344,57 @@ fn processBuffer(self: *Input) !?Event.Event {
 }
 
 /// Poll the file descriptor for input
-fn pollFd(self: *Input, timeout_ms: ?u32) !usize {
-    var fds = [_]posix.pollfd{
-        .{
-            .fd = self.fd,
+fn pollFds(self: *Input, timeout_ms: ?u32, extra_fd: ?posix.fd_t) !struct { input_ready: bool, extra_ready: bool } {
+    var fds: [2]posix.pollfd = undefined;
+    var count: usize = 0;
+
+    fds[count] = .{
+        .fd = self.fd,
+        .events = posix.POLL.IN,
+        .revents = 0,
+    };
+    count += 1;
+
+    if (extra_fd) |fd| {
+        fds[count] = .{
+            .fd = fd,
             .events = posix.POLL.IN,
             .revents = 0,
-        },
-    };
+        };
+        count += 1;
+    }
 
     const timeout: i32 = if (timeout_ms) |ms| @intCast(ms) else -1;
-    const result = try posix.poll(&fds, timeout);
+    const result = try posix.poll(fds[0..count], timeout);
 
-    if (result > 0 and (fds[0].revents & posix.POLL.IN) != 0) {
-        return 1;
+    if (result > 0) {
+        const input_ready = (fds[0].revents & posix.POLL.IN) != 0;
+        const extra_ready = if (count > 1) (fds[1].revents & posix.POLL.IN) != 0 else false;
+        return .{ .input_ready = input_ready, .extra_ready = extra_ready };
     }
-    return 0;
+
+    return .{ .input_ready = false, .extra_ready = false };
 }
 
 /// Read available input into buffer
-fn readInput(self: *Input) !usize {
+fn readInput(self: *Input) !ReadResult {
     // Read into buffer starting at current length
     const space = self.input_buf.len - self.input_len;
-    if (space == 0) return 0;
+    if (space == 0) return .no_space;
 
     const start = self.input_len;
     const bytes_read = posix.read(self.fd, self.input_buf[self.input_len..]) catch |err| switch (err) {
-        error.WouldBlock => return 0,
+        error.WouldBlock => return .would_block,
         else => return err,
     };
+
+    if (bytes_read == 0) return .eof;
 
     self.input_len += bytes_read;
     if (bytes_read > 0) {
         self.trace.logBytes("read", self.input_buf[start..][0..bytes_read]);
     }
-    return bytes_read;
+    return .{ .read = bytes_read };
 }
 
 /// Check if escape timeout has expired
@@ -368,4 +420,50 @@ test "Input init and deinit" {
     defer input.deinit();
 
     try std.testing.expectEqual(default_escape_timeout_ms, input.escape_timeout_ms);
+}
+
+test "Input readInput returns WouldBlock on empty non-blocking fd" {
+    const pipe_fds = try posix.pipe();
+    defer {
+        posix.close(pipe_fds[0]);
+        posix.close(pipe_fds[1]);
+    }
+
+    const O_NONBLOCK: usize = @as(u32, @bitCast(posix.O{ .NONBLOCK = true }));
+    const read_flags = try posix.fcntl(pipe_fds[0], posix.F.GETFL, 0);
+    _ = try posix.fcntl(pipe_fds[0], posix.F.SETFL, read_flags | O_NONBLOCK);
+
+    var input = Input.init(std.testing.allocator, pipe_fds[0]);
+    defer input.deinit();
+
+    const result = try input.readInput();
+    try std.testing.expect(result == .would_block);
+}
+
+test "Input pollEventWithExtraFd returns extra_ready" {
+    const input_pipe = try posix.pipe();
+    defer {
+        posix.close(input_pipe[0]);
+        posix.close(input_pipe[1]);
+    }
+
+    const extra_pipe = try posix.pipe();
+    defer {
+        posix.close(extra_pipe[0]);
+        posix.close(extra_pipe[1]);
+    }
+
+    const O_NONBLOCK: usize = @as(u32, @bitCast(posix.O{ .NONBLOCK = true }));
+    const read_flags = try posix.fcntl(input_pipe[0], posix.F.GETFL, 0);
+    _ = try posix.fcntl(input_pipe[0], posix.F.SETFL, read_flags | O_NONBLOCK);
+
+    var input = Input.init(std.testing.allocator, input_pipe[0]);
+    defer input.deinit();
+
+    const byte = [_]u8{1};
+    _ = try posix.write(extra_pipe[1], &byte);
+
+    const result = try input.pollEventWithExtraFd(50, extra_pipe[0]);
+    try std.testing.expect(result != null);
+    try std.testing.expect(result.? == .extra_ready);
 }
