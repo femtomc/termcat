@@ -257,6 +257,10 @@ pub fn present(self: *Terminal) !void {
 /// Set the cursor position (visible cursor).
 pub fn setCursor(self: *Terminal, pos: ?Position) void {
     self.renderer.setCursor(pos);
+    if (self.renderer.cursor_dirty) {
+        self.dirty = true;
+        self.maybeAutoPresent();
+    }
 }
 
 /// Show the cursor at the given position.

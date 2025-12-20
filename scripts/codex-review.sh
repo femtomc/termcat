@@ -23,7 +23,7 @@ NC='\033[0m'
 echo -e "${BLUE}=== Codex Review for ${ISSUE_ID} ===${NC}"
 
 # Get issue title
-ISSUE_TITLE=$(bd show "$ISSUE_ID" 2>&1 | grep -v '^$' | head -1 | sed 's/^[^ ]* //')
+ISSUE_TITLE=$(tissue show "$ISSUE_ID" 2>&1 | sed -n 's/^Title: //p' || true)
 if [[ -z "$ISSUE_TITLE" ]]; then
     echo -e "${RED}Error: Could not fetch issue ${ISSUE_ID}${NC}"
     exit 1
@@ -107,7 +107,7 @@ if [[ -z "$JSON" ]]; then
 fi
 
 VERDICT=$(echo "$JSON" | jq -r '.verdict')
-bd comment "$ISSUE_ID" "[REVIEW:codex] $JSON"
+tissue comment "$ISSUE_ID" -m "[REVIEW:codex] $JSON"
 
 echo -e "${BLUE}=== Result ===${NC}"
 echo "Verdict: $VERDICT"
@@ -116,6 +116,6 @@ if [[ "$VERDICT" == "LGTM" ]]; then
     echo -e "${GREEN}Approved!${NC}"
     exit 0
 else
-    echo -e "${YELLOW}Changes requested. View: bd comments $ISSUE_ID${NC}"
+    echo -e "${YELLOW}Changes requested. View: tissue show $ISSUE_ID${NC}"
     exit 1
 fi
